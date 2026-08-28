@@ -770,7 +770,8 @@ class SettingsPage(QWidget):
         self.clear_key_button = QPushButton("Clear saved API key"); self.clear_key_button.clicked.connect(self.clear_api_key)
         self.api_controls = (self.api_enabled, self.api_url, self.api_model, self.api_key, self.clear_key_button)
         api_form.addRow("API", self.api_enabled); api_form.addRow("Base URL", self.api_url); api_form.addRow("Model", self.api_model); api_form.addRow("API key", self.api_key); api_form.addRow("", self.clear_key_button)
-        self.model.currentTextChanged.connect(self.update_api_controls); self.model.currentIndexChanged.connect(self.update_api_controls); self.model.activated.connect(self.update_api_controls); self.update_api_controls(); QTimer.singleShot(0, self.update_api_controls); self.detect_local_models()
+        self.model.currentTextChanged.connect(self.update_api_controls); self.model.currentIndexChanged.connect(self.update_api_controls); self.model.activated.connect(self.update_api_controls)
+        self.model.currentTextChanged.connect(lambda _value: QTimer.singleShot(0, self.update_api_controls)); self.update_api_controls(); QTimer.singleShot(0, self.update_api_controls); self.detect_local_models()
 
         resume_form = section("Resume", "Select the resume CareerOS uses. TXT, PDF and Word are extracted locally; the source is copied and preserved.")
         resume_row = QVBoxLayout(); self.resume_label = QLabel(); self.resume_label.setWordWrap(True); self.resume_label.setObjectName("resumeSelection"); import_resume = QPushButton("Select Resume File..."); import_resume.clicked.connect(self.import_resume); resume_row.addWidget(import_resume); resume_row.addWidget(self.resume_label)
@@ -865,8 +866,10 @@ class SettingsPage(QWidget):
         self.api_card.setProperty("apiFieldsDisabled", not api_selected)
         for control in self.api_controls:
             control.setEnabled(api_selected)
-        style = self.api_card.style()
-        style.unpolish(self.api_card); style.polish(self.api_card)
+        if api_selected:
+            self.api_card.setStyleSheet("QWidget#apiSettingsCard{background:#ffffff;border:1px solid #dde1e8;border-radius:13px} QWidget#apiSettingsCard QLabel,QWidget#apiSettingsCard QCheckBox{color:#1d1d1f;background:transparent} QWidget#apiSettingsCard QLineEdit{background:#fbfcfe;color:#1d1d1f;border:1px solid #d7dbe3;border-radius:9px}")
+        else:
+            self.api_card.setStyleSheet("QWidget#apiSettingsCard{background:#eceef2;border:1px solid #d7dbe3;border-radius:13px} QWidget#apiSettingsCard QLabel,QWidget#apiSettingsCard QCheckBox{color:#8b93a1;background:transparent} QWidget#apiSettingsCard QLineEdit{background:#e5e7eb;color:#9aa1ad;border:1px solid #d7dbe3;border-radius:9px}")
 
     def browse_data_dir(self):
         selected = QFileDialog.getExistingDirectory(self, "Choose CareerOS Data Directory", self.data_dir.text())
