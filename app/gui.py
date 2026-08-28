@@ -1092,9 +1092,13 @@ def _startup_splash() -> QSplashScreen:
     language = load_settings().get("language", "en")
     message = "正在加载本地求职工作区…" if language == "zh" else "Loading your local career workspace…"
     painter.drawText(QRect(margin, lower_top + 59, 600, 26), Qt.AlignLeft | Qt.AlignVCenter, message)
-    painter.setBrush(QColor("#7db6ff")); painter.setPen(Qt.NoPen); painter.drawRoundedRect(QRect(margin, lower_top + 96, 216, 4), 2, 2)
     painter.end()
-    return QSplashScreen(canvas, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+    splash = QSplashScreen(canvas, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+    loading_bar = QProgressBar(splash); loading_bar.setRange(0, 0); loading_bar.setTextVisible(False)
+    loading_bar.setGeometry(margin, lower_top + 96, 216, 6)
+    loading_bar.setStyleSheet("QProgressBar{border:none;border-radius:3px;background:rgba(255,255,255,55)} QProgressBar::chunk{border-radius:3px;background:#7db6ff}")
+    splash.loading_bar = loading_bar
+    return splash
 
 
 def run_gui():
@@ -1102,7 +1106,7 @@ def run_gui():
     elapsed = QElapsedTimer(); elapsed.start()
     splash = _startup_splash(); splash.show(); app.processEvents()
     window = MainWindow()
-    remaining = max(0, 1800 - elapsed.elapsed())
+    remaining = max(0, 3000 - elapsed.elapsed())
     if remaining:
         wait_loop = QEventLoop(); QTimer.singleShot(remaining, wait_loop.quit); wait_loop.exec()
     window.show(); splash.finish(window)
