@@ -12,7 +12,7 @@ import traceback
 import unicodedata
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QRect, QSize, QThread, QTimer, Signal, Qt, QUrl
+from PySide6.QtCore import QEasingCurve, QElapsedTimer, QEvent, QEventLoop, QObject, QPropertyAnimation, QRect, QSize, QThread, QTimer, Signal, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPixmap
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -1076,7 +1076,7 @@ class MainWindow(QMainWindow):
 
 def _startup_splash() -> QSplashScreen:
     """Create a brief branded loading window before the main workspace is built."""
-    size = QSize(960, 540)
+    size = QSize(768, 432)
     image = QPixmap(str(Path(__file__).resolve().parents[1] / "assets" / "splash-background.jpg"))
     canvas = QPixmap(size); canvas.fill(QColor("#14365d"))
     painter = QPainter(canvas); painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -1084,20 +1084,26 @@ def _startup_splash() -> QSplashScreen:
         scaled = image.scaled(size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         painter.drawPixmap((size.width() - scaled.width()) // 2, (size.height() - scaled.height()) // 2, scaled)
     painter.fillRect(canvas.rect(), QColor(4, 22, 47, 42))
-    painter.fillRect(QRect(0, 388, size.width(), 152), QColor(5, 20, 39, 178))
-    painter.setPen(QColor("#ffffff")); painter.setFont(QFont("Segoe UI Variable Display", 29, QFont.DemiBold))
-    painter.drawText(QRect(42, 414, 600, 48), Qt.AlignLeft | Qt.AlignVCenter, "CareerOS")
-    painter.setPen(QColor("#d9e9ff")); painter.setFont(QFont("Segoe UI", 12))
+    lower_top = int(size.height() * 0.72); margin = int(size.width() * 0.044)
+    painter.fillRect(QRect(0, lower_top, size.width(), size.height() - lower_top), QColor(5, 20, 39, 178))
+    painter.setPen(QColor("#ffffff")); painter.setFont(QFont("Segoe UI Variable Display", 23, QFont.DemiBold))
+    painter.drawText(QRect(margin, lower_top + 16, 500, 42), Qt.AlignLeft | Qt.AlignVCenter, "CareerOS")
+    painter.setPen(QColor("#d9e9ff")); painter.setFont(QFont("Segoe UI", 10))
     language = load_settings().get("language", "en")
     message = "正在加载本地求职工作区…" if language == "zh" else "Loading your local career workspace…"
-    painter.drawText(QRect(44, 466, 720, 30), Qt.AlignLeft | Qt.AlignVCenter, message)
-    painter.setBrush(QColor("#7db6ff")); painter.setPen(Qt.NoPen); painter.drawRoundedRect(QRect(44, 510, 270, 5), 2, 2)
+    painter.drawText(QRect(margin, lower_top + 59, 600, 26), Qt.AlignLeft | Qt.AlignVCenter, message)
+    painter.setBrush(QColor("#7db6ff")); painter.setPen(Qt.NoPen); painter.drawRoundedRect(QRect(margin, lower_top + 96, 216, 4), 2, 2)
     painter.end()
     return QSplashScreen(canvas, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
 
 
 def run_gui():
     app = QApplication.instance() or QApplication([]); app.setStyle("Fusion")
+    elapsed = QElapsedTimer(); elapsed.start()
     splash = _startup_splash(); splash.show(); app.processEvents()
-    window = MainWindow(); window.show(); splash.finish(window)
+    window = MainWindow()
+    remaining = max(0, 1800 - elapsed.elapsed())
+    if remaining:
+        wait_loop = QEventLoop(); QTimer.singleShot(remaining, wait_loop.quit); wait_loop.exec()
+    window.show(); splash.finish(window)
     return app.exec()
