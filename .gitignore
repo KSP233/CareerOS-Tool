@@ -1,0 +1,20 @@
+# Local runtime and packaging output
+runtime/
+build/
+release-v2/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# User-specific state and secrets
+.api-key-encryption
+data-location.json
+CareerOS-data/
+data/
+logs/
+cache/
+
+# Windows/editor files
+*.log
+Thumbs.db
+.DS_Store

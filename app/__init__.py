@@ -1,0 +1,1 @@
+"""CareerOS local desktop application."""
