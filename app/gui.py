@@ -12,7 +12,7 @@ import traceback
 import unicodedata
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QSize, QThread, QTimer, Signal, Qt, QUrl
+from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPropertyAnimation, QRect, QSize, QThread, QTimer, Signal, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPixmap
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QAbstractItemView, QAbstractSpinBox, QGraphicsOpacityEffect, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QSizePolicy,
+    QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QSplashScreen,
 )
 
 from app.ai_manager import AIManager
@@ -1074,5 +1074,30 @@ class MainWindow(QMainWindow):
     def settings_changed(self): self.jobs.refresh_models(); self.jobs.refresh_location_choices(); self.refresh_pages()
 
 
+def _startup_splash() -> QSplashScreen:
+    """Create a brief branded loading window before the main workspace is built."""
+    size = QSize(960, 540)
+    image = QPixmap(str(Path(__file__).resolve().parents[1] / "assets" / "splash-background.jpg"))
+    canvas = QPixmap(size); canvas.fill(QColor("#14365d"))
+    painter = QPainter(canvas); painter.setRenderHint(QPainter.SmoothPixmapTransform)
+    if not image.isNull():
+        scaled = image.scaled(size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+        painter.drawPixmap((size.width() - scaled.width()) // 2, (size.height() - scaled.height()) // 2, scaled)
+    painter.fillRect(canvas.rect(), QColor(4, 22, 47, 42))
+    painter.fillRect(QRect(0, 388, size.width(), 152), QColor(5, 20, 39, 178))
+    painter.setPen(QColor("#ffffff")); painter.setFont(QFont("Segoe UI Variable Display", 29, QFont.DemiBold))
+    painter.drawText(QRect(42, 414, 600, 48), Qt.AlignLeft | Qt.AlignVCenter, "CareerOS")
+    painter.setPen(QColor("#d9e9ff")); painter.setFont(QFont("Segoe UI", 12))
+    language = load_settings().get("language", "en")
+    message = "正在加载本地求职工作区…" if language == "zh" else "Loading your local career workspace…"
+    painter.drawText(QRect(44, 466, 720, 30), Qt.AlignLeft | Qt.AlignVCenter, message)
+    painter.setBrush(QColor("#7db6ff")); painter.setPen(Qt.NoPen); painter.drawRoundedRect(QRect(44, 510, 270, 5), 2, 2)
+    painter.end()
+    return QSplashScreen(canvas, Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+
+
 def run_gui():
-    app = QApplication.instance() or QApplication([]); app.setStyle("Fusion"); window = MainWindow(); window.show(); return app.exec()
+    app = QApplication.instance() or QApplication([]); app.setStyle("Fusion")
+    splash = _startup_splash(); splash.show(); app.processEvents()
+    window = MainWindow(); window.show(); splash.finish(window)
+    return app.exec()
