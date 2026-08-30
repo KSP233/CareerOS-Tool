@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+SUPPORTED_RESUME_IMPORT_EXTENSIONS = {".docx"}
+
+
 IS_PORTABLE_BUILD = bool(getattr(sys, "frozen", False))
 PROGRAM_DIR = Path(sys.executable).resolve().parent if IS_PORTABLE_BUILD else Path(__file__).resolve().parent
 # A packaged copy is intentionally self-contained: it never discovers or reuses
@@ -35,13 +38,16 @@ DEFAULT_SETTINGS = {
     },
     "resume_path": "",
     "generation_prompts": {
-        "resume": "",
-        "cover_letter": "",
+        "general": "",
     },
     "resume_pdf": {
         "style": "Modern",
         "font_size": 9,
+        "font_family": "Helvetica",
+        "line_spacing": 1.0,
+        "section_spacing": "Normal",
         "margins": "Standard",
+        "docx_layout": "Professional one-page",
     },
     "match_weights": {
         "rule": 70,

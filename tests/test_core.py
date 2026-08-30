@@ -13,8 +13,10 @@ import config
 from app.database import Database
 from app.form_fill import build_form_fill_script, form_fill_values
 from app.pdf_export import render_cover_letter_pdf, render_resume_pdf
+from app.docx_export import render_resume_docx
 from app.secrets import protect_secret, unprotect_secret
 from app.services import JobService, ResumeService, SupportingDocumentService, compact_job_text, evaluate_requirement, extract_job_facts, generation_instruction, weighted_match_score
+from app.ai_manager import AIError, validated_endpoint
 from app.validators import recommendation, validate_job_analysis, validate_resume_changes
 
 
@@ -73,6 +75,20 @@ class CoreTests(unittest.TestCase):
         first = service.import_file(str(source)); second = service.import_file(str(source))
         self.assertEqual(first["added"], 1); self.assertEqual(second["existing"], 1)
 
+    def test_no_resume_clears_legacy_query_derived_scores(self):
+        job_id, _ = self.db.upsert_job({"company":"ABC", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/no-resume", "description":"Mechanical engineering", "description_hash":"no-resume"})
+        self.db.update_job(job_id, rule_score=55, ai_score=50, match_score=54)
+        with patch.object(JobService, "_resume_text", return_value=""):
+            JobService(self.db, DummyAI())
+        job = self.db.job(job_id)
+        self.assertIsNone(job["rule_score"]); self.assertIsNone(job["ai_score"]); self.assertIsNone(job["match_score"])
+
+    def test_analyze_requires_candidate_resume_evidence(self):
+        job_id, _ = self.db.upsert_job({"company":"ABC", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/analyze-empty", "description":"CAD", "description_hash":"analyze-empty"})
+        service = JobService(self.db, DummyAI())
+        with self.assertRaisesRegex(ValueError, "Import an original DOCX"):
+            service.analyze(job_id, "")
+
     def test_recommendation_bands(self):
         self.assertEqual(recommendation(85), "EXCELLENT"); self.assertEqual(recommendation(75), "GOOD"); self.assertEqual(recommendation(60), "POSSIBLE"); self.assertEqual(recommendation(39), "POOR")
 
@@ -89,6 +105,16 @@ class CoreTests(unittest.TestCase):
     def test_analysis_validation(self):
         value = {"ai_score":82,"required_matches":[],"preferred_matches":[],"missing_skills":[],"strengths":[],"risks":[],"reason":"ok","recommendation":"GOOD"}
         self.assertEqual(validate_job_analysis(value)["ai_score"], 82)
+
+    def test_job_analysis_payload_has_a_single_resume_label(self):
+        class RecordingAI:
+            def generate_json(self, _task, _prompt, payload, *_args):
+                self.payload = payload
+                return {"ai_score":50,"required_matches":[],"preferred_matches":[],"missing_skills":[],"strengths":[],"risks":[],"reason":"ok","recommendation":"POSSIBLE"}, "test"
+        ai = RecordingAI(); service = JobService(self.db, ai)
+        job_id, _ = self.db.upsert_job({"company":"ABC", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/analysis", "description":"Python", "description_hash":"analysis"})
+        service.analyze(job_id, "RESUME:\nJane Doe\nPython")
+        self.assertTrue(ai.payload.startswith("RESUME:\nJane Doe")); self.assertNotIn("RESUME:\nRESUME:", ai.payload)
 
     def test_rule_score_penalizes_seniority(self):
         junior = JobService._rule_score("Python CAD engineering", "Python CAD engineering", "Ottawa")[0]
@@ -130,9 +156,23 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("\n\n\n", compacted)
         self.assertIn("• Bachelor's degree.", compacted)
 
+    def test_job_html_is_converted_without_markdownify(self):
+        compacted = compact_job_text("<h1>Requirements</h1><ul><li>CAD &amp; CFD</li></ul>")
+        self.assertIn("Requirements", compacted); self.assertIn("• CAD & CFD", compacted); self.assertNotIn("<h1>", compacted)
+
+    def test_external_ai_requires_https_and_local_ai_requires_loopback(self):
+        self.assertEqual(validated_endpoint("http://127.0.0.1:11434", local_only=True), "http://127.0.0.1:11434")
+        self.assertEqual(validated_endpoint("https://api.example.com/v1"), "https://api.example.com/v1")
+        with self.assertRaises(AIError): validated_endpoint("http://api.example.com/v1")
+        with self.assertRaises(AIError): validated_endpoint("https://remote.example.com", local_only=True)
+
     def test_windows_api_key_protection_roundtrip(self):
-        encrypted = protect_secret("test-key-not-real")
+        try:
+            encrypted = protect_secret("test-key-not-real")
+        except OSError as exc:
+            self.skipTest(f"Windows DPAPI is unavailable to this sandbox account: {exc}")
         self.assertNotIn("test-key-not-real", encrypted)
+        self.assertTrue(encrypted.startswith("dpapi:"))
         self.assertEqual(unprotect_secret(encrypted), "test-key-not-real")
 
     def test_form_fill_script_uses_only_confirmed_contact_values_and_never_submits(self):
@@ -157,7 +197,7 @@ class CoreTests(unittest.TestCase):
         description = "Compensation AB: $22 - $32.25. MB & ON: $20.50 - $30.25. NB: $19.50 - $30.25."
         self.assertEqual(JobService._salary_from_description(description), "$19.5 - $32.25 (varies by location)")
 
-    def test_resume_tab_switches_back_to_resume_preview(self):
+    def test_resume_and_cv_draft_tabs_use_separate_preview_panels(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
         from app.gui import ResumePage
@@ -166,9 +206,14 @@ class CoreTests(unittest.TestCase):
         service = type("Resume", (), {"original_text": lambda self: (_ for _ in ()).throw(FileNotFoundError()), "imported_source_path": lambda self: None})()
         page = ResumePage(database, service)
         page.document_lists.setCurrentIndex(1)
+        page.show_document_category(1)
         self.assertIs(page.document_stack.currentWidget(), page.cover_panel)
+        self.assertEqual(page.generate_draft_button.text(), "Generate CV Draft")
         page.document_lists.setCurrentIndex(0)
         self.assertIs(page.document_stack.currentWidget(), page.resume_panel)
+        self.assertEqual(page.generate_draft_button.text(), "Generate Resume Draft")
+        self.assertFalse(hasattr(page, "generate_resume_button"))
+        self.assertFalse(hasattr(page, "generate_cv_button"))
 
     def test_application_rows_show_explicit_start_and_post_dates(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -204,7 +249,7 @@ class CoreTests(unittest.TestCase):
         from app.gui import JobsPage
         app = QApplication.instance() or QApplication([])
         self.db.upsert_job({"company":"ABC", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/filter", "description":"", "description_hash":"filter"})
-        page = JobsPage(self.db, type("J", (), {})(), type("R", (), {})(), type("C", (), {})(), type("A", (), {"available_models": lambda self: []})())
+        page = JobsPage(self.db, type("J", (), {})(), type("R", (), {})(), type("A", (), {"available_models": lambda self: []})())
         page.status_filter.setItemText(0, "所有状态")
         page.location_filter.setItemText(0, "所有地点")
         self.assertEqual(len(page.filtered()), 1)
@@ -218,6 +263,12 @@ class CoreTests(unittest.TestCase):
         extracted = service.import_original(str(source))
         self.assertIn("Mechanical engineering candidate", extracted.read_text(encoding="utf-8"))
         self.assertTrue(list(service.paths.resumes_original.glob("source-*.docx")))
+
+    def test_docx_export_uses_professional_layout(self):
+        root = Path(self.tmp.name)
+        professional, layout = render_resume_docx("Jane Doe\n\nPROJECTS\n- Built a test rig.", root / "professional.docx", {"docx_layout": "Professional one-page"})
+        self.assertTrue(professional.exists())
+        self.assertEqual(layout, "Professional one-page")
 
     def test_data_directory_migration_copies_database_and_keeps_source(self):
         original_locator = config.LOCATION_FILE
@@ -240,6 +291,31 @@ class CoreTests(unittest.TestCase):
                 connection.close()
         finally:
             config.LOCATION_FILE = original_locator
+
+    def test_database_merge_remaps_jobs_and_copies_only_source_tree_files(self):
+        root = Path(self.tmp.name); source_root = root / "source-data"; target_root = root / "target-data"
+        source_db_path = source_root / "data" / "careeros.db"; source_db = Database(source_db_path)
+        job_id, _ = source_db.upsert_job({"company":"Merged Co", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/merged", "description":"CAD", "description_hash":"merged"})
+        original = source_root / "resumes" / "original" / "original-merge.txt"; original.parent.mkdir(parents=True); original.write_text("Jane Doe\nSKILLS\nCAD", encoding="utf-8")
+        version_id = source_db.add_resume_version(job_id=job_id, version_name="resume_v001", content="draft", source_path=str(original), document_type="Resume")
+        source_db.set_resume_decision(version_id, True); source_db.mark_applied(job_id)
+        paths = type("P", (), {"backups":target_root / "backups", "resumes_original":target_root / "resumes" / "original", "resumes_generated":target_root / "resumes" / "generated", "resumes_approved":target_root / "resumes" / "approved", "cover_letters":target_root / "cover_letters", "supporting_documents":target_root / "supporting_documents"})()
+        for value in vars(paths.__class__).values():
+            if isinstance(value, Path): value.mkdir(parents=True, exist_ok=True)
+        target = Database(target_root / "data" / "careeros.db")
+        with patch("app.database.get_paths", return_value=paths):
+            result = target.merge_from(source_db_path)
+        self.assertEqual(result["jobs"], 1); self.assertEqual(result["drafts"], 1); self.assertEqual(result["applications"], 1)
+        merged = target.resume_versions()[0]
+        self.assertTrue(Path(merged["source_path"]).is_file())
+        self.assertEqual(target.job(merged["job_id"])["company"], "Merged Co")
+
+    def test_supporting_document_delete_refuses_path_outside_storage(self):
+        root = Path(self.tmp.name); storage = root / "supporting"; storage.mkdir(); outside = root / "keep.txt"; outside.write_text("keep", encoding="utf-8")
+        service = SupportingDocumentService(self.db); service.paths = type("P", (), {"supporting_documents": storage})()
+        document_id = self.db.add_supporting_document("tampered.txt", str(outside), None, "ready", 4)
+        service.remove(document_id)
+        self.assertTrue(outside.exists())
 
     def test_legacy_applypilot_database_is_copied_to_careeros_database(self):
         root = Path(self.tmp.name) / "legacy-root"

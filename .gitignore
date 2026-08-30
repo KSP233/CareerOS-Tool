@@ -1,7 +1,7 @@
 # Local runtime and packaging output
 runtime/
 build/
-release-v2/
+release/
 __pycache__/
 **/__pycache__/
 *.py[cod]
