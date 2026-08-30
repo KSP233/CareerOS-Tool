@@ -1,20 +1,79 @@
-# Local runtime and packaging output
-runtime/
-build/
-release/
+# =========================
+# Python cache / test cache
+# =========================
+.pytest_cache/
 __pycache__/
 **/__pycache__/
 *.py[cod]
 
-# User-specific state and secrets
-.api-key-encryption
-data-location.json
+# =========================
+# Build / release output
+# =========================
+build/
+dist/
+release/
+release-v2/
+*.zip
+*.exe
+
+# =========================
+# Local runtime
+# =========================
+runtime/
+
+# =========================
+# User data / generated files
+# =========================
 CareerOS-data/
 data/
 logs/
 cache/
 
-# Windows/editor files
-*.log
+resumes/
+supporting_documents/
+
+*.pdf
+*.docx
+
+# =========================
+# Databases
+# =========================
+*.db
+*.sqlite
+*.sqlite3
+*-wal
+*-shm
+
+# =========================
+# Secrets / local config
+# =========================
+.api-key-encryption
+data-location.json
+.env
+.env.*
+*.pem
+*.pfx
+*.key
+
+# =========================
+# Virtual environments
+# =========================
+.venv/
+venv/
+
+# =========================
+# IDE / editor
+# =========================
+.vscode/
+.idea/
+
+# =========================
+# OS junk
+# =========================
 Thumbs.db
 .DS_Store
+
+# =========================
+# Logs
+# =========================
+*.log
