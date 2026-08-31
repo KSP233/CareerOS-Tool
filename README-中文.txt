@@ -1,4 +1,4 @@
-CareerOS 本地求职工作区 v0.2.0
+CareerOS 本地求职工作区 v0.3.0
 
 源码运行：双击 START.cmd；诊断运行：双击 START-DEBUG.cmd。
 移动版：解压完整 ZIP 后双击 CareerOS.exe，不要单独移动 EXE。

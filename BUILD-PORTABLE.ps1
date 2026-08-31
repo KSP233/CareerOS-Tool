@@ -13,8 +13,8 @@ if ($RefreshDependencies) {
 & $runtimePython -B -m unittest discover -s (Join-Path $projectRoot "tests") -q
 if ($LASTEXITCODE -ne 0) { throw "Tests failed" }
 
-$buildRoot = Join-Path $projectRoot "build\portable-v020"
-$distRoot = Join-Path $projectRoot "release\portable-v020"
+$buildRoot = Join-Path $projectRoot "build\portable-v030"
+$distRoot = Join-Path $projectRoot "release\portable-v030"
 foreach ($candidate in @($buildRoot, $distRoot)) {
     $full = [IO.Path]::GetFullPath($candidate)
     if (-not $full.StartsWith([IO.Path]::GetFullPath($projectRoot), [StringComparison]::OrdinalIgnoreCase)) { throw "Unsafe build path: $full" }
@@ -42,7 +42,7 @@ $lines = Get-ChildItem -LiteralPath $appFolder -Recurse -File | Where-Object { $
 }
 [IO.File]::WriteAllLines($manifest, $lines, [Text.UTF8Encoding]::new($false))
 
-$zip = Join-Path (Join-Path $projectRoot "release") "CareerOS-Portable-unsigned-v0.2.0.zip"
+$zip = Join-Path (Join-Path $projectRoot "release") "CareerOS-Portable-unsigned-v0.3.0.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -LiteralPath $appFolder -DestinationPath $zip -CompressionLevel Optimal
 Write-Host "Portable package: $zip"

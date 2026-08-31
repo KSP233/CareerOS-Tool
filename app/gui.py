@@ -2865,8 +2865,10 @@ class ApplicationTrackerPage(QWidget):
             empty.setObjectName("timelineEmpty")
             self.timeline_layout.addWidget(empty)
         else:
-            events = self._timeline_events if self._timeline_show_all_events else self._timeline_events[-3:]
-            for index, event in enumerate(reversed(events)):
+            # Database results are newest first. Keep that order so the compact
+            # default view really shows the most recent three timeline events.
+            events = self._timeline_events if self._timeline_show_all_events else self._timeline_events[:3]
+            for index, event in enumerate(events):
                 row = QWidget()
                 row.setObjectName("timelineEvent")
                 row_layout = QHBoxLayout(row)
@@ -3413,9 +3415,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._apply_windows_backdrop); QTimer.singleShot(0, self.refresh_ai_provider_status)
 
     def closeEvent(self, event):
-        scan = getattr(self.settings, "model_scan", None)
-        if scan and scan.isRunning():
-            scan.wait(3500)
+        # Both local-model scans are short loopback requests. Wait briefly so a
+        # running QThread cannot outlive the window during an immediate close.
+        for worker in (getattr(self.settings, "model_scan", None), getattr(self, "provider_status_worker", None)):
+            if worker and worker.isRunning():
+                worker.wait(3500)
         super().closeEvent(event)
 
     def _apply_windows_backdrop(self):
@@ -3499,6 +3503,9 @@ class MainWindow(QMainWindow):
 
     def refresh_ai_provider_status(self) -> None:
         """Show a truthful provider label without sending any external AI request."""
+        existing = getattr(self, "provider_status_worker", None)
+        if existing and existing.isRunning():
+            return
         self.ai.reload_settings(); selected = str(self.ai.settings.get("ai_mode") or "Auto")
         if selected == "API":
             label = self.ai.api_label()

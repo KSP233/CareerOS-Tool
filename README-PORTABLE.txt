@@ -1,4 +1,4 @@
-CareerOS Portable v0.2.0（未做数字签名）
+CareerOS Portable v0.3.0（未做数字签名）
 
 使用方法：
 1. 解压完整 ZIP，不要只把 CareerOS.exe 单独拖出来。

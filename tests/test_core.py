@@ -51,7 +51,9 @@ class CoreTests(unittest.TestCase):
         self.db.mark_applied(job_id)
         self.assertEqual(self.db.job(job_id)["status"], "Applied")
         self.assertTrue(self.db.unmark_applied(job_id))
-        self.assertEqual(self.db.job(job_id)["status"], "Ready")
+        self.assertEqual(self.db.job(job_id)["status"], "Interested")
+        self.assertEqual(self.db.application_rows(), [])
+        self.assertEqual(self.db.application_events(job_id)[0]["event_type"], "Moved to Apply")
 
     def test_remove_draft_records(self):
         job_id, _ = self.db.upsert_job({"company":"ABC", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/draft", "description":"", "description_hash":"draft"})
@@ -295,13 +297,16 @@ class CoreTests(unittest.TestCase):
     def test_application_rows_show_explicit_start_and_post_dates(self):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         from PySide6.QtWidgets import QApplication
-        from app.gui import ApplicationsPage
+        from app.gui import ApplicationTrackerPage
         app = QApplication.instance() or QApplication([])
-        self.db.upsert_job({"company":"ABC", "title":"Engineering Co-op - Starting Fall 2027", "location":"Ottawa", "url":"https://example.com/dates", "description":"Posted role", "description_hash":"dates", "start_date":"Fall 2027", "date_posted":"2026-08-27T10:00:00"})
-        page = ApplicationsPage(self.db)
-        self.assertEqual(page.table.columnCount(), 8)
-        self.assertEqual(page.table.item(0, 4).text(), "Fall 2027")
-        self.assertEqual(page.table.item(0, 5).text(), "2026-08-27")
+        job_id, _ = self.db.upsert_job({"company":"ABC", "title":"Engineering Co-op - Starting Fall 2027", "location":"Ottawa", "url":"https://example.com/dates", "description":"Posted role", "description_hash":"dates", "start_date":"Fall 2027", "date_posted":"2026-08-27T10:00:00"})
+        self.db.update_job(job_id, status="Interested")
+        self.db.mark_applied(job_id)
+        page = ApplicationTrackerPage(self.db)
+        self.assertEqual(page.job_list.count(), 1)
+        row = self.db.application_rows()[0]
+        self.assertEqual(row["start_date"], "Fall 2027")
+        self.assertEqual(row["date_posted"][:10], "2026-08-27")
 
     def test_start_date_is_saved_with_job_and_not_reparsed_for_applications(self):
         job = {"company":"ABC", "title":"Co-op - Starting Winter 2027", "location":"Ottawa", "url":"https://example.com/start", "description":"Details", "description_hash":"start", "start_date":"Winter 2027"}
