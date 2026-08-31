@@ -20,7 +20,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS jobs_identity ON jobs(company, title, location
 CREATE TABLE IF NOT EXISTS resume_versions (id INTEGER PRIMARY KEY, job_id INTEGER, parent_version_id INTEGER, generation_job_id INTEGER, version_name TEXT NOT NULL, source_path TEXT, content TEXT NOT NULL, changes_json TEXT NOT NULL DEFAULT '[]', document_type TEXT NOT NULL DEFAULT 'Resume', document_json TEXT NOT NULL DEFAULT '', style_json TEXT NOT NULL DEFAULT '', layout_json TEXT NOT NULL DEFAULT '', template_version TEXT NOT NULL DEFAULT 'v2', layout_version TEXT NOT NULL DEFAULT 'v2', model_used TEXT, created_at TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(job_id) REFERENCES jobs(id));
 CREATE TABLE IF NOT EXISTS cover_letters (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL, path TEXT NOT NULL, content TEXT NOT NULL, model_used TEXT, created_at TEXT NOT NULL, FOREIGN KEY(job_id) REFERENCES jobs(id));
 CREATE TABLE IF NOT EXISTS supporting_documents (id INTEGER PRIMARY KEY, original_name TEXT NOT NULL, stored_path TEXT NOT NULL, extracted_path TEXT, extraction_status TEXT NOT NULL DEFAULT 'stored', character_count INTEGER NOT NULL DEFAULT 0, added_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS applications (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL, applied_at TEXT, previous_status TEXT NOT NULL DEFAULT 'New', resume_version_id INTEGER, cover_letter_id INTEGER, notes TEXT NOT NULL DEFAULT '', FOREIGN KEY(job_id) REFERENCES jobs(id));
+CREATE TABLE IF NOT EXISTS applications (id INTEGER PRIMARY KEY, job_id INTEGER NOT NULL UNIQUE, status TEXT NOT NULL, applied_at TEXT, interview_at TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', follow_up TEXT NOT NULL DEFAULT '', previous_status TEXT NOT NULL DEFAULT 'New', resume_version_id INTEGER, cover_letter_id INTEGER, notes TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, FOREIGN KEY(job_id) REFERENCES jobs(id));
+CREATE TABLE IF NOT EXISTS application_events (id INTEGER PRIMARY KEY, application_id INTEGER NOT NULL, event_type TEXT NOT NULL, event_date TEXT NOT NULL, details TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, FOREIGN KEY(application_id) REFERENCES applications(id) ON DELETE CASCADE);
 CREATE TABLE IF NOT EXISTS ai_requests (id INTEGER PRIMARY KEY, task TEXT NOT NULL, model TEXT NOT NULL, elapsed_ms INTEGER NOT NULL, success INTEGER NOT NULL, created_at TEXT NOT NULL, error TEXT);
 """
 
@@ -49,7 +50,24 @@ class Database:
         for name, declaration in {"document_type":"TEXT NOT NULL DEFAULT 'Resume'", "document_json":"TEXT NOT NULL DEFAULT ''", "style_json":"TEXT NOT NULL DEFAULT ''", "layout_json":"TEXT NOT NULL DEFAULT ''", "parent_version_id":"INTEGER", "generation_job_id":"INTEGER", "template_version":"TEXT NOT NULL DEFAULT 'v2'", "layout_version":"TEXT NOT NULL DEFAULT 'v2'"}.items():
             if name not in versions: db.execute(f"ALTER TABLE resume_versions ADD COLUMN {name} {declaration}")
         applications = {row[1] for row in db.execute("PRAGMA table_info(applications)")}
-        if "previous_status" not in applications: db.execute("ALTER TABLE applications ADD COLUMN previous_status TEXT NOT NULL DEFAULT 'New'")
+        for name, declaration in {
+            "previous_status":"TEXT NOT NULL DEFAULT 'New'",
+            "interview_at":"TEXT NOT NULL DEFAULT ''",
+            "contact":"TEXT NOT NULL DEFAULT ''",
+            "follow_up":"TEXT NOT NULL DEFAULT ''",
+            "notes":"TEXT NOT NULL DEFAULT ''",
+            "active":"INTEGER NOT NULL DEFAULT 1",
+        }.items():
+            if name not in applications: db.execute(f"ALTER TABLE applications ADD COLUMN {name} {declaration}")
+        db.execute("""CREATE TABLE IF NOT EXISTS application_events (
+            id INTEGER PRIMARY KEY,
+            application_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(application_id) REFERENCES applications(id) ON DELETE CASCADE
+        )""")
 
     def backup(self) -> Path | None:
         if not self.path.exists() or not self.path.stat().st_size: return None
@@ -73,6 +91,17 @@ class Database:
 
     def jobs(self) -> list[dict]:
         with self.connection() as db: return [dict(row) for row in db.execute("SELECT * FROM jobs ORDER BY COALESCE(match_score,rule_score,-1) DESC,date_found DESC")]
+
+    def job_summaries(self) -> list[dict]:
+        """Lightweight rows for job lists; large descriptions/AI payloads load on selection."""
+        sql = """
+            SELECT id, company, title, location, salary, source, status,
+                   rule_score, match_score, date_found
+            FROM jobs
+            ORDER BY COALESCE(match_score, rule_score, -1) DESC, date_found DESC
+        """
+        with self.connection() as db:
+            return [dict(row) for row in db.execute(sql)]
     def job(self, job_id: int) -> dict | None:
         with self.connection() as db:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone(); return dict(row) if row else None
@@ -131,17 +160,76 @@ class Database:
             if row: db.execute("DELETE FROM supporting_documents WHERE id=?",(document_id,))
             return dict(row) if row else None
     def mark_applied(self, job_id: int) -> None:
+        """Create the manual tracker entry for a job and record its first timeline event."""
         with self.connection() as db:
-            job=db.execute("SELECT status FROM jobs WHERE id=?",(job_id,)).fetchone(); before=job["status"] if job and job["status"] != "Applied" else "New"
-            db.execute("INSERT INTO applications(job_id,status,applied_at,previous_status) VALUES(?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,applied_at=excluded.applied_at",(job_id,"Applied",_now(),before)); db.execute("UPDATE jobs SET status='Applied' WHERE id=?",(job_id,))
+            job=db.execute("SELECT status FROM jobs WHERE id=?",(job_id,)).fetchone(); before=job["status"] if job and job["status"] != "Applied" else "Interested"
+            now = _now()
+            existing = db.execute("SELECT id,status,active FROM applications WHERE job_id=?", (job_id,)).fetchone()
+            db.execute("INSERT INTO applications(job_id,status,applied_at,previous_status,active) VALUES(?,?,?,?,1) ON CONFLICT(job_id) DO UPDATE SET status=excluded.status, applied_at=COALESCE(applications.applied_at, excluded.applied_at), active=1",(job_id,"Applied",now,before))
+            app = db.execute("SELECT id FROM applications WHERE job_id=?", (job_id,)).fetchone()
+            if app and (not existing or existing["status"] != "Applied" or not int(existing["active"] or 0)):
+                db.execute("INSERT INTO application_events(application_id,event_type,event_date,details,created_at) VALUES(?,?,?,?,?)", (app["id"], "Applied", now[:10], "Application marked as applied manually.", now))
+            db.execute("UPDATE jobs SET status='Applied' WHERE id=?",(job_id,))
+
     def unmark_applied(self, job_id: int) -> bool:
+        """Return an application to Apply without destroying its tracking history."""
         with self.connection() as db:
-            row=db.execute("SELECT previous_status FROM applications WHERE job_id=?",(job_id,)).fetchone()
+            row=db.execute("SELECT id,previous_status FROM applications WHERE job_id=?",(job_id,)).fetchone()
             if not row: return False
-            db.execute("DELETE FROM applications WHERE job_id=?",(job_id,)); db.execute("UPDATE jobs SET status=? WHERE id=? AND status='Applied'",(row["previous_status"] or "New",job_id)); return True
-    def application_rows(self) -> list[dict]:
-        query="SELECT j.*,a.applied_at,(SELECT version_name FROM resume_versions r WHERE r.job_id=j.id AND r.approved=1 AND r.document_type='Resume' ORDER BY r.id DESC LIMIT 1) AS resume_version,(SELECT version_name FROM resume_versions r WHERE r.job_id=j.id AND r.approved=1 AND r.document_type='CV' ORDER BY r.id DESC LIMIT 1) AS cv_version FROM jobs j LEFT JOIN applications a ON a.job_id=j.id ORDER BY COALESCE(a.applied_at,j.date_found) DESC"
+            now = _now(); target = "Interested"
+            db.execute("UPDATE applications SET active=0 WHERE job_id=?",(job_id,))
+            db.execute("UPDATE jobs SET status=? WHERE id=?",(target,job_id))
+            db.execute("INSERT INTO application_events(application_id,event_type,event_date,details,created_at) VALUES(?,?,?,?,?)", (row["id"], "Moved to Apply", now[:10], "Application moved back to Apply; tracking details preserved.", now))
+            return True
+
+    def interested_application_rows(self) -> list[dict]:
+        query="""SELECT j.*,
+            (SELECT version_name FROM resume_versions r WHERE r.job_id=j.id AND r.approved=1 AND r.document_type='Resume' ORDER BY r.id DESC LIMIT 1) AS resume_version,
+            (SELECT version_name FROM resume_versions r WHERE r.job_id=j.id AND r.approved=1 AND r.document_type='CV' ORDER BY r.id DESC LIMIT 1) AS cv_version
+            FROM jobs j WHERE j.status='Interested'
+            ORDER BY COALESCE(j.match_score,j.rule_score,-1) DESC,j.date_found DESC"""
         with self.connection() as db: return [dict(row) for row in db.execute(query)]
+
+    def application_rows(self) -> list[dict]:
+        query="""SELECT j.*,a.id AS application_id,a.status AS application_status,a.applied_at,a.interview_at,a.contact,a.follow_up,a.notes,
+            (SELECT version_name FROM resume_versions r WHERE r.job_id=j.id AND r.approved=1 AND r.document_type='Resume' ORDER BY r.id DESC LIMIT 1) AS resume_version,
+            (SELECT version_name FROM resume_versions r WHERE r.job_id=j.id AND r.approved=1 AND r.document_type='CV' ORDER BY r.id DESC LIMIT 1) AS cv_version
+            FROM applications a JOIN jobs j ON j.id=a.job_id
+            WHERE COALESCE(a.active,1)=1
+            ORDER BY COALESCE(a.applied_at,j.date_found) DESC"""
+        with self.connection() as db: return [dict(row) for row in db.execute(query)]
+
+    def application(self, job_id: int) -> dict | None:
+        with self.connection() as db:
+            row = db.execute("SELECT * FROM applications WHERE job_id=?", (job_id,)).fetchone()
+            return dict(row) if row else None
+
+    def update_application(self, job_id: int, *, status: str, applied_at: str = '', interview_at: str = '', contact: str = '', notes: str = '', follow_up: str = '') -> None:
+        allowed = {"Applied", "Interview", "Offer", "Rejected", "Withdrawn"}
+        if status not in allowed:
+            raise ValueError(f"Unsupported application status: {status}")
+        with self.connection() as db:
+            current = db.execute("SELECT id,status,previous_status FROM applications WHERE job_id=?", (job_id,)).fetchone()
+            if not current:
+                before = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                previous = before["status"] if before else "Interested"
+                db.execute("INSERT INTO applications(job_id,status,applied_at,interview_at,contact,follow_up,previous_status,notes) VALUES(?,?,?,?,?,?,?,?)", (job_id,status,applied_at or _now(),interview_at,contact,follow_up,previous,notes))
+                current = db.execute("SELECT id,status,previous_status FROM applications WHERE job_id=?", (job_id,)).fetchone()
+                old_status = ""
+            else:
+                old_status = current["status"]
+                db.execute("UPDATE applications SET status=?,applied_at=?,interview_at=?,contact=?,follow_up=?,notes=? WHERE job_id=?", (status,applied_at,interview_at,contact,follow_up,notes,job_id))
+            db.execute("UPDATE jobs SET status=? WHERE id=?", (status,job_id))
+            if old_status != status:
+                app_id = current["id"]
+                event_date = interview_at if status == "Interview" and interview_at else (applied_at or _now()[:10])
+                db.execute("INSERT INTO application_events(application_id,event_type,event_date,details,created_at) VALUES(?,?,?,?,?)", (app_id,status,event_date,f"Status changed to {status}.",_now()))
+
+    def application_events(self, job_id: int) -> list[dict]:
+        query="""SELECT e.* FROM application_events e
+            JOIN applications a ON a.id=e.application_id
+            WHERE a.job_id=? ORDER BY e.event_date DESC,e.id DESC"""
+        with self.connection() as db: return [dict(row) for row in db.execute(query,(job_id,))]
 
     def merge_from(self, source_path: str | Path) -> dict[str, int | str]:
         """Merge another CareerOS database without importing its Settings/API key.

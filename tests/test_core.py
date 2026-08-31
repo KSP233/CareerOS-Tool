@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,7 +18,7 @@ from app.pdf_export import render_cover_letter_pdf, render_resume_pdf
 from app.docx_export import render_resume_docx
 from app.secrets import protect_secret, unprotect_secret
 from app.services import JobService, ResumeService, SupportingDocumentService, compact_job_text, evaluate_requirement, extract_job_facts, generation_instruction, weighted_match_score
-from app.ai_manager import AIError, validated_endpoint
+from app.ai_manager import AIError, AIManager, external_chat_endpoint, validated_endpoint
 from app.validators import recommendation, validate_job_analysis, validate_resume_changes
 
 
@@ -108,13 +110,88 @@ class CoreTests(unittest.TestCase):
 
     def test_job_analysis_payload_has_a_single_resume_label(self):
         class RecordingAI:
-            def generate_json(self, _task, _prompt, payload, *_args):
-                self.payload = payload
+            def generate_json(self, _task, _prompt, payload, *_args, **kwargs):
+                self.payload = payload; self.kwargs = kwargs
                 return {"ai_score":50,"required_matches":[],"preferred_matches":[],"missing_skills":[],"strengths":[],"risks":[],"reason":"ok","recommendation":"POSSIBLE"}, "test"
         ai = RecordingAI(); service = JobService(self.db, ai)
         job_id, _ = self.db.upsert_job({"company":"ABC", "title":"Engineer", "location":"Ottawa", "url":"https://example.com/analysis", "description":"Python", "description_hash":"analysis"})
         service.analyze(job_id, "RESUME:\nJane Doe\nPython")
         self.assertTrue(ai.payload.startswith("RESUME:\nJane Doe")); self.assertNotIn("RESUME:\nRESUME:", ai.payload)
+        self.assertIn("progress", ai.kwargs); self.assertIn("cancelled", ai.kwargs)
+
+    def test_external_chat_endpoint_matches_openai_compatibility_url(self):
+        self.assertEqual(
+            external_chat_endpoint("https://generativelanguage.googleapis.com/v1beta/openai/"),
+            "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        )
+
+    def test_external_api_retries_503_then_accepts_openai_response(self):
+        settings = {"ollama_url":"http://127.0.0.1:11434", "api": {}}
+        manager = AIManager(self.db, settings)
+        endpoint = "https://example.test/v1/chat/completions"
+        transient = urllib.error.HTTPError(endpoint, 503, "Unavailable", {"Retry-After":"0"}, io.BytesIO(b'{"error":{"message":"busy"}}'))
+        class Response:
+            status = 200; headers = {"x-request-id":"provider-123"}
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return b'{"choices":[{"message":{"content":"{\\"ok\\":true}"}}]}'
+        with patch("app.ai_manager.urllib.request.urlopen", side_effect=[transient, Response()]) as request, patch("app.ai_manager._wait_with_cancellation") as wait:
+            result = manager._external_post_json(endpoint, "not-a-real-key", {"model":"test", "stream":False}, request_id="test-request", system_prompt="system", user_prompt="user")
+        self.assertEqual(result["choices"][0]["message"]["content"], '{"ok":true}')
+        self.assertEqual(request.call_count, 2); wait.assert_called_once()
+
+    def test_unreadable_legacy_api_key_has_clean_reentry_error(self):
+        settings = {"ollama_url":"http://127.0.0.1:11434", "api": {"model":"test", "encrypted_key":"legacy-token", "base_url":"https://example.test/v1"}}
+        manager = AIManager(self.db, settings)
+        with patch("app.ai_manager.unprotect_secret", side_effect=ValueError("invalid legacy key")):
+            with self.assertRaisesRegex(AIError, "Re-enter it in Settings"):
+                manager._generate_api("system", "user", 0.2)
+
+    def test_local_model_download_is_allowlisted_and_uses_only_loopback_ollama(self):
+        manager = AIManager(self.db, {"ollama_url":"http://127.0.0.1:11434", "api": {}})
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def __iter__(self): return iter([b'{"status":"pulling manifest"}\n', b'{"status":"success","total":100,"completed":100}\n'])
+        updates = []
+        with patch("app.ai_manager.urllib.request.urlopen", return_value=Response()) as request:
+            result = manager.pull_local_model("llama3.2:3b", updates.append, lambda: False)
+        submitted = json.loads(request.call_args.args[0].data.decode("utf-8"))
+        self.assertEqual(request.call_args.args[0].full_url, "http://127.0.0.1:11434/api/pull")
+        self.assertEqual(submitted, {"name":"llama3.2:3b", "stream":True})
+        self.assertEqual(result["model"], "llama3.2:3b"); self.assertTrue(any("100%" in value for value in updates))
+        with self.assertRaisesRegex(ValueError, "reviewed local model"):
+            manager.pull_local_model("unreviewed-model")
+
+    def test_local_model_catalog_includes_gpt_oss_with_hardware_guidance(self):
+        catalog = AIManager(self.db, {"ollama_url":"http://127.0.0.1:11434", "api": {}}).local_model_catalog()
+        self.assertIn("gpt-oss:20b", catalog)
+        self.assertIn("gpt-oss:120b", catalog)
+        self.assertIn("VRAM", catalog["gpt-oss:20b"]["vram"])
+        self.assertIn("80 GB", catalog["gpt-oss:120b"]["vram"])
+
+    def test_delete_local_model_requires_installed_model_and_calls_loopback(self):
+        manager = AIManager(self.db, {"ollama_url":"http://127.0.0.1:11434", "api": {}})
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+        with patch.object(manager, "available_models", return_value=["llama3.2:3b"]), patch("app.ai_manager.urllib.request.urlopen", return_value=Response()) as request:
+            manager.delete_local_model("llama3.2:3b")
+        self.assertEqual(request.call_args.args[0].full_url, "http://127.0.0.1:11434/api/delete")
+        with patch.object(manager, "available_models", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "not installed locally"):
+                manager.delete_local_model("llama3.2:3b")
+
+    def test_automatic_ollama_install_uses_windows_package_manager_only_after_ui_confirmation(self):
+        manager = AIManager(self.db, {"ollama_url":"http://127.0.0.1:11434", "api": {}})
+        class Process:
+            returncode = 0
+            def poll(self): return 0
+        with patch("app.ai_manager.os.name", "nt"), patch("app.ai_manager.shutil.which", return_value="C:/Windows/System32/winget.exe"), patch("app.ai_manager.subprocess.Popen", return_value=Process()) as launch:
+            result = manager.install_ollama(lambda _message: None, lambda: False)
+        self.assertEqual(result["status"], "installed")
+        command = launch.call_args.args[0]
+        self.assertEqual(command[:4], ["C:/Windows/System32/winget.exe", "install", "--id", "Ollama.Ollama"])
 
     def test_rule_score_penalizes_seniority(self):
         junior = JobService._rule_score("Python CAD engineering", "Python CAD engineering", "Ottawa")[0]

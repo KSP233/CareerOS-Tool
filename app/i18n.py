@@ -61,8 +61,12 @@ def localize_widget_tree(root, language: str | None = None) -> None:
     if isinstance(root, QMainWindow):
         root.setWindowTitle(translate(_original(root, "_careeros_title", root.windowTitle()), language))
     for widget in root.findChildren(QLabel):
+        if widget.property("_careeros_keep_english"):
+            continue
         widget.setText(translate(_original(widget, "_careeros_text", widget.text()), language))
     for widget in root.findChildren(QAbstractButton):
+        if widget.property("_careeros_keep_english"):
+            continue
         widget.setText(translate(_original(widget, "_careeros_text", widget.text()), language))
     for widget in root.findChildren(QComboBox):
         originals = widget.property("_careeros_items")

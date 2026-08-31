@@ -15,6 +15,7 @@ CareerOS Portable v0.2.0（未做数字签名）
 - Auto apply 永久禁用；CareerOS 不会自动投递。
 - 外部 API 必须使用 HTTPS；本地 AI 的 HTTP 地址只允许 localhost/回环地址。
 - API 密钥使用 Windows DPAPI 绑定当前 Windows 账户。换电脑后需要重新输入。
+- Settings > Local AI models 可经 Windows Package Manager 安装 Ollama，或在已安装的 Ollama 中下载 CareerOS 推荐的本地模型。安装/下载前会显示说明并要求确认；模型下载后，简历与职位内容只在本机处理。
 
 Word/PDF：
 - 安装 Microsoft Word 时，CareerOS 使用 Word 生成最终 PDF。

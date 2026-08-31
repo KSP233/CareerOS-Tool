@@ -1,79 +1,122 @@
 # =========================
-# Python cache / test cache
+# Python
 # =========================
-.pytest_cache/
 __pycache__/
-**/__pycache__/
 *.py[cod]
+*$py.class
+*.pyd
+*.so
 
-# =========================
-# Build / release output
-# =========================
-build/
-dist/
-release/
-release-v2/
-*.zip
-*.exe
-
-# =========================
-# Local runtime
-# =========================
-runtime/
-
-# =========================
-# User data / generated files
-# =========================
-CareerOS-data/
-data/
-logs/
-cache/
-
-resumes/
-supporting_documents/
-
-*.pdf
-*.docx
-
-# =========================
-# Databases
-# =========================
-*.db
-*.sqlite
-*.sqlite3
-*-wal
-*-shm
-
-# =========================
-# Secrets / local config
-# =========================
-.api-key-encryption
-data-location.json
-.env
-.env.*
-*.pem
-*.pfx
-*.key
-
-# =========================
 # Virtual environments
-# =========================
 .venv/
 venv/
+env/
+ENV/
+
+# =========================
+# Testing / coverage
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
 
 # =========================
 # IDE / editor
 # =========================
 .vscode/
 .idea/
+*.code-workspace
 
 # =========================
-# OS junk
+# OS files
 # =========================
-Thumbs.db
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Temporary / backup files
+# =========================
+*.bak
+*.tmp
+*.temp
+*.old
+*.orig
+*.pre_*
+*~
+~$*
+
+# =========================
+# CareerOS build output
+# =========================
+build/
+dist/
+release/
+runtime/
+
+# PyInstaller generated intermediates
+*.manifest
+
+# Keep the actual spec file tracked
+# CareerOS.spec should remain in Git
 
 # =========================
 # Logs
 # =========================
 *.log
+logs/
+
+# =========================
+# Local databases / user data
+# =========================
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+data/
+userdata/
+
+# =========================
+# Secrets / API credentials
+# =========================
+.env
+.env.*
+!.env.example
+
+*.key
+*.pem
+*.p12
+*.pfx
+
+# CareerOS local secret/config files
+.api-key-encryption
+api-key*
+secrets.json
+credentials.json
+token.json
+
+# =========================
+# Local/generated Resume data
+# =========================
+resumes_original/
+resumes_generated/
+generated/
+exports/
+
+# =========================
+# Packaging archives
+# =========================
+*.zip
+*.7z
+*.rar
+
+# =========================
+# Misc generated files
+# =========================
+*.cache
+.cache/

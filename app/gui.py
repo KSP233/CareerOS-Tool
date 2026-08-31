@@ -13,18 +13,18 @@ import unicodedata
 from uuid import uuid4
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QElapsedTimer, QEvent, QEventLoop, QObject, QPropertyAnimation, QRect, QSize, QThread, QTimer, Signal, Qt, QUrl
+from PySide6.QtCore import QElapsedTimer, QEvent, QEventLoop, QObject, QRect, QSize, QThread, QTimer, Signal, Qt, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QLinearGradient, QPainter, QPixmap
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtPdfWidgets import QPdfView
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
-    QAbstractItemView, QAbstractSpinBox, QGraphicsOpacityEffect, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
-    QTableWidgetItem, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QSplashScreen, QMenu,
+    QAbstractItemView, QAbstractSpinBox, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QStyle, QTableWidget,
+    QTableWidgetItem, QTabWidget, QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QSizePolicy, QSplashScreen, QMenu, QToolButton, QFrame,
 )
 
-from app.ai_manager import AIManager
+from app.ai_manager import AICancelled, AIManager
 from app.database import Database
 from app.docx_export import export_docx_pdf
 from app.form_fill import CONTACT_FIELDS, build_form_fill_script, form_fill_values
@@ -143,6 +143,162 @@ class CollapsibleSection(QWidget):
         self.header.setFocus(reason)
 
 
+class CardActionPopup(QWidget):
+    """Small frameless popup used by compact cards instead of native QMenu.
+
+    Native Windows QMenu adds its own rectangular shadow/window frame around
+    styled rounded menus.  This popup is fully Qt-painted, so CareerOS can keep
+    clean rounded corners without the square artifact.
+    """
+
+    def __init__(self, actions, parent=None):
+        super().__init__(None, Qt.Popup | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setObjectName("cardActionPopup")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        surface = QFrame(self)
+        surface.setObjectName("cardActionSurface")
+        layout = QVBoxLayout(surface)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(1)
+
+        for label, callback in actions:
+            button = QPushButton(str(label), surface)
+            button.setObjectName("cardActionItem")
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, cb=callback: self._run(cb))
+            layout.addWidget(button)
+
+        outer.addWidget(surface)
+        self.adjustSize()
+
+    def _run(self, callback):
+        self.close()
+        callback()
+
+    def show_for(self, anchor: QWidget) -> None:
+        self.adjustSize()
+        bottom_right = anchor.mapToGlobal(anchor.rect().bottomRight())
+        x = bottom_right.x() - self.sizeHint().width()
+        y = bottom_right.y() + 4
+        self.move(x, y)
+        self.show()
+        self.raise_()
+
+
+class CompactCardWidget(QWidget):
+    """Compact object card used by Jobs and Applications lists.
+
+    The primary information stays on the left while the score/status badge is
+    treated as a clear secondary focal point on the right and vertically
+    centered. Jobs cards stay mouse-transparent so Ctrl/Shift multi-select keeps
+    native QListWidget behavior. Application cards may expose a three-dot menu.
+    """
+
+    def __init__(self, primary: str, title: str, badge: str = "", meta: str = "", extra: str = "", *, tone: str = "neutral", menu_actions=None, parent=None):
+        super().__init__(parent)
+        self.setObjectName("compactCard")
+        self._target = None
+        self._item = None
+        self._has_menu = bool(menu_actions)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, not self._has_menu)
+
+        root = QHBoxLayout(self)
+        root.setContentsMargins(13, 9, 9 if self._has_menu else 13, 9)
+        root.setSpacing(12)
+
+        # Left: the descriptive content. Keeping this in its own column makes
+        # the right-side score/status read like one consistent card affordance.
+        content = QWidget(self)
+        content.setObjectName("compactCardContent")
+        content.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(3)
+
+        primary_label = QLabel(str(primary or "Untitled"))
+        primary_label.setObjectName("compactCardPrimary")
+        primary_label.setTextFormat(Qt.PlainText)
+        primary_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        content_layout.addWidget(primary_label)
+
+        title_label = QLabel(str(title or ""))
+        title_label.setObjectName("compactCardTitle")
+        title_label.setTextFormat(Qt.PlainText)
+        title_label.setWordWrap(False)
+        title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        content_layout.addWidget(title_label)
+
+        if meta:
+            meta_label = QLabel(str(meta))
+            meta_label.setObjectName("compactCardMeta")
+            meta_label.setTextFormat(Qt.PlainText)
+            meta_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            content_layout.addWidget(meta_label)
+
+        if extra:
+            extra_label = QLabel(str(extra))
+            extra_label.setObjectName("compactCardExtra")
+            extra_label.setTextFormat(Qt.PlainText)
+            extra_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            content_layout.addWidget(extra_label)
+
+        root.addWidget(content, 1)
+
+        # Right: vertically centered score/status, plus an optional compact menu.
+        actions = QWidget(self)
+        actions.setObjectName("compactCardActions")
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(7)
+        actions_layout.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
+
+        badge_label = QLabel(str(badge or ""))
+        badge_label.setObjectName("compactCardBadge")
+        badge_label.setProperty("tone", tone)
+        badge_label.setAlignment(Qt.AlignCenter)
+        badge_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        badge_label.setMinimumWidth(46)
+        if not badge:
+            badge_label.hide()
+        actions_layout.addWidget(badge_label, 0, Qt.AlignVCenter)
+
+        if self._has_menu:
+            menu_button = QToolButton(self)
+            menu_button.setObjectName("compactCardMenuButton")
+            menu_button.setText("•••")
+            menu_button.setToolTip("More actions")
+            menu_button.setCursor(Qt.PointingHandCursor)
+            popup = CardActionPopup(menu_actions, self)
+            menu_button._card_popup = popup  # keep the popup alive with the button
+            menu_button.clicked.connect(lambda _checked=False, b=menu_button, p=popup: p.show_for(b))
+            actions_layout.addWidget(menu_button, 0, Qt.AlignVCenter)
+
+        root.addWidget(actions, 0, Qt.AlignVCenter)
+
+    def bind_item(self, target: QListWidget, item: QListWidgetItem) -> None:
+        self._target, self._item = target, item
+
+    def mousePressEvent(self, event):
+        if self._has_menu and self._target is not None and self._item is not None and event.button() == Qt.LeftButton:
+            self._target.setCurrentItem(self._item)
+        super().mousePressEvent(event)
+
+def add_compact_card(target: QListWidget, job_id: int, *, primary: str, title: str, badge: str = "", meta: str = "", extra: str = "", tone: str = "neutral", height: int = 82, menu_actions=None) -> QListWidgetItem:
+    item = QListWidgetItem()
+    item.setData(Qt.UserRole, job_id)
+    item.setSizeHint(QSize(100, height))
+    target.addItem(item)
+    card = CompactCardWidget(primary, title, badge, meta, extra, tone=tone, menu_actions=menu_actions)
+    if menu_actions: card.bind_item(target, item)
+    target.setItemWidget(item, card)
+    return item
+
+
 class DashboardPage(QWidget):
     def __init__(self, db: Database):
         super().__init__(); self.db = db; layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 22); layout.setSpacing(14)
@@ -181,36 +337,399 @@ class JobDialog(QDialog):
         return {"company": self.company.text(), "title": self.title.text(), "location": self.location.text(), "url": self.url.text(), "source": "manual", "description": self.description.toPlainText()}
 
 
+class JobSearchPage(QWidget):
+    """Dedicated multi-location / multi-role job discovery page."""
+    changed = Signal()
+    settings_saved = Signal()
+
+    def __init__(self, service: JobService):
+        super().__init__()
+        self.service = service
+        self.worker = None
+        self.task_started_at = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 28)
+        root.setSpacing(14)
+
+        title = QLabel("<h1>Search Jobs</h1><p style='color:#6e7786;margin-top:-7px'>Find opportunities across multiple locations and job titles.</p>")
+        title.setMinimumHeight(62)
+        root.addWidget(title)
+
+        card = QWidget(); card.setObjectName("jobSearchCard")
+        card_layout = QVBoxLayout(card); card_layout.setContentsMargins(20, 18, 20, 18); card_layout.setSpacing(16)
+
+        settings = load_settings().get("search", {})
+        two_col = QHBoxLayout(); two_col.setSpacing(16)
+
+        location_box = QVBoxLayout(); location_box.setSpacing(6)
+        location_box.addWidget(QLabel("<b>Locations</b><br/><span style='color:#7a8494;font-size:11px'>One per line</span>"))
+        self.search_locations = QTextEdit(); self.search_locations.setObjectName("jobSearchTextEdit"); self.search_locations.setFixedHeight(78)
+        self.search_locations.setPlaceholderText("Mississauga, ON\nToronto, ON")
+        self.search_locations.setPlainText("\n".join(settings.get("locations", [])))
+        location_box.addWidget(self.search_locations)
+
+        query_box = QVBoxLayout(); query_box.setSpacing(6)
+        query_box.addWidget(QLabel("<b>Job titles</b><br/><span style='color:#7a8494;font-size:11px'>One per line</span>"))
+        self.search_queries = QTextEdit(); self.search_queries.setObjectName("jobSearchTextEdit"); self.search_queries.setFixedHeight(78)
+        self.search_queries.setPlaceholderText("Mechanical Designer\nMechanical Engineering Intern")
+        self.search_queries.setPlainText("\n".join(settings.get("queries", [])))
+        query_box.addWidget(self.search_queries)
+        two_col.addLayout(location_box, 1); two_col.addLayout(query_box, 1); card_layout.addLayout(two_col)
+
+        source_row = QHBoxLayout(); source_row.setSpacing(10); source_row.addWidget(QLabel("<b>Sources</b>"))
+        self.search_sites = {}
+        for key, label in SEARCH_SITES.items():
+            box = QCheckBox(label); box.setChecked(key in settings.get("sites", [])); box.stateChanged.connect(self._search_form_changed); self.search_sites[key] = box; source_row.addWidget(box)
+        source_row.addStretch(); card_layout.addLayout(source_row)
+
+        bottom = QHBoxLayout(); bottom.setSpacing(10)
+        bottom.addWidget(QLabel("<b>Distance</b>"))
+        self.search_distance = QSpinBox(); self.search_distance.setRange(1, 500); self.search_distance.setSuffix(" miles"); self.search_distance.setValue(int(settings.get("distance", 30))); self.search_distance.setMaximumWidth(160); bottom.addWidget(self.search_distance)
+        bottom.addSpacing(8)
+        self.search_summary = QLabel(); self.search_summary.setObjectName("jobSearchSummary"); bottom.addWidget(self.search_summary)
+        bottom.addStretch()
+        self.search_button = QPushButton("Search Jobs"); self.search_button.setObjectName("primaryButton"); self.search_button.setMinimumWidth(140); self.search_button.clicked.connect(self.run_search); bottom.addWidget(self.search_button)
+        card_layout.addLayout(bottom)
+
+        self.search_status = QLabel(""); self.search_status.setObjectName("jobSearchStatus"); self.search_status.setWordWrap(True); self.search_status.hide(); card_layout.addWidget(self.search_status)
+        root.addWidget(card); root.addStretch(1)
+
+        self.autosave_timer = QTimer(self); self.autosave_timer.setSingleShot(True); self.autosave_timer.timeout.connect(self.save_search_settings)
+        self.search_locations.textChanged.connect(self._search_form_changed); self.search_queries.textChanged.connect(self._search_form_changed); self.search_distance.valueChanged.connect(self._search_form_changed)
+        self.update_search_summary()
+
+    def _values(self):
+        locations = [line.strip() for line in self.search_locations.toPlainText().splitlines() if line.strip()]
+        queries = [line.strip() for line in self.search_queries.toPlainText().splitlines() if line.strip()]
+        sites = [key for key, box in self.search_sites.items() if box.isChecked()]
+        return locations, queries, sites
+
+    def update_search_summary(self):
+        locations, queries, sites = self._values(); total = len(locations) * len(queries) * len(sites)
+        self.search_summary.setText(f"{total} search{'es' if total != 1 else ''} will run")
+
+    def _set_status(self, text: str):
+        self.search_status.setText(text); self.search_status.setVisible(bool(text))
+
+    def _search_form_changed(self, *_):
+        self.update_search_summary(); self.autosave_timer.start(500)
+
+    def save_search_settings(self, *, show_error=False) -> bool:
+        locations, queries, sites = self._values()
+        if not locations or not queries or not sites:
+            if show_error: QMessageBox.information(self, "Search Jobs", "Add at least one location, one job title, and one source before searching.")
+            return False
+        settings = load_settings(); search = settings.setdefault("search", {})
+        search["locations"] = list(dict.fromkeys(locations)); search["queries"] = list(dict.fromkeys(queries)); search["sites"] = sites; search["distance"] = self.search_distance.value(); save_settings(settings); self.settings_saved.emit(); return True
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        seconds = max(0, round(seconds)); return f"{seconds // 60}:{seconds % 60:02d}"
+
+    def busy(self, text):
+        self._set_status("● " + translate(text))
+        shell = self.window()
+        if hasattr(shell, "update_task_state"): shell.update_task_state(translate(text), self.task_started_at)
+
+    def finish_task_progress(self):
+        shell = self.window(); elapsed = time.monotonic() - self.task_started_at if self.task_started_at else 0
+        if hasattr(shell, "finish_task_state"): shell.finish_task_state(translate(f"Completed in {self._duration(elapsed)}"))
+        self.task_started_at = None; self.search_button.setEnabled(True)
+
+    def fail(self, text):
+        self.finish_task_progress(); self._set_status("Search failed"); QMessageBox.critical(self, "CareerOS", user_error_message(text))
+
+    def run_search(self):
+        if not self.save_search_settings(show_error=True): return
+        if self.worker and self.worker.isRunning(): QMessageBox.information(self, "CareerOS", "A search is already running."); return
+        self.search_button.setEnabled(False); self._set_status("● Starting search…"); self.task_started_at = time.monotonic(); self.worker = TaskThread(self.service.search, with_progress=True)
+        shell = self.window()
+        if hasattr(shell, "begin_task_state"): shell.begin_task_state(self.worker, translate("Searching jobs..."))
+        def completed(result):
+            if result.get("cancelled", False): self._set_status("Search cancelled")
+            else: self._set_status(f"✓ {result['added']} new jobs · {result['existing']} existing" + (f" · {result['errors']} warnings" if result['errors'] else ""))
+            self.changed.emit(); self.finish_task_progress()
+            QTimer.singleShot(6500, lambda: self._set_status("") if not (self.worker and self.worker.isRunning()) else None)
+        self.worker.completed.connect(completed); self.worker.failed.connect(self.fail); self.worker.progress.connect(self.busy); self.worker.start()
+
+
+class MatchAnalysisPanel(QScrollArea):
+    """Structured, read-only job-match analysis panel."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("matchAnalysisScroll")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._body = QWidget()
+        self._body.setObjectName("matchAnalysisBody")
+        self._layout = QVBoxLayout(self._body)
+        self._layout.setContentsMargins(14, 14, 14, 18)
+        self._layout.setSpacing(12)
+        self.setWidget(self._body)
+        self.set_empty("Select a job to view its match analysis.")
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                MatchAnalysisPanel._clear_layout(child_layout)
+
+    def set_empty(self, text: str):
+        self._clear_layout(self._layout)
+        label = QLabel(text)
+        label.setObjectName("matchAnalysisEmpty")
+        label.setWordWrap(True)
+        self._layout.addWidget(label)
+        self._layout.addStretch(1)
+
+    def _section(self, title: str, rows, *, tone: str = "neutral", empty_text: str = "Not stated"):
+        frame = QFrame()
+        frame.setObjectName("matchAnalysisSection")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(12, 10, 12, 11)
+        layout.setSpacing(7)
+        heading = QLabel(title)
+        heading.setObjectName("matchAnalysisSectionTitle")
+        layout.addWidget(heading)
+        values = list(rows or [])
+        if not values:
+            empty = QLabel(empty_text)
+            empty.setObjectName("matchAnalysisMuted")
+            empty.setWordWrap(True)
+            layout.addWidget(empty)
+        else:
+            symbols = {"good": "✓", "missing": "△", "warning": "•", "neutral": "•"}
+            symbol = symbols.get(tone, "•")
+            for value in values:
+                row = QLabel(f"{symbol}  {value}")
+                row.setObjectName(f"matchAnalysisRow_{tone}")
+                row.setWordWrap(True)
+                row.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                layout.addWidget(row)
+        self._layout.addWidget(frame)
+
+    def _requirements_section(self, title: str, values, candidate_facts: str):
+        frame = QFrame()
+        frame.setObjectName("matchAnalysisSection")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(12, 10, 12, 11)
+        layout.setSpacing(7)
+        heading = QLabel(title)
+        heading.setObjectName("matchAnalysisSectionTitle")
+        layout.addWidget(heading)
+        values = list(values or [])
+        if not values:
+            empty = QLabel("Not stated")
+            empty.setObjectName("matchAnalysisMuted")
+            layout.addWidget(empty)
+        else:
+            labels = {
+                "LIKELY_MET": ("Likely met", "good"),
+                "NOT_CONFIRMED": ("Not confirmed", "neutral"),
+                "DOES_NOT_MEET": ("Does not meet", "missing"),
+            }
+            for requirement in values:
+                row = QWidget()
+                row.setObjectName("matchRequirementRow")
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 0, 0, 0)
+                row_layout.setSpacing(8)
+                state = evaluate_requirement(requirement, candidate_facts)
+                label_text, tone = labels.get(state, ("Not confirmed", "neutral"))
+                badge = QLabel(label_text)
+                badge.setObjectName(f"requirementBadge_{tone}")
+                badge.setAlignment(Qt.AlignCenter)
+                badge.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                text = QLabel(str(requirement))
+                text.setObjectName("matchRequirementText")
+                text.setWordWrap(True)
+                text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                row_layout.addWidget(badge, 0, Qt.AlignTop)
+                row_layout.addWidget(text, 1)
+                layout.addWidget(row)
+        self._layout.addWidget(frame)
+
+    def set_analysis(self, job: dict, facts: dict, candidate_facts: str):
+        self._clear_layout(self._layout)
+
+        # Summary header
+        summary = QFrame()
+        summary.setObjectName("matchAnalysisSummary")
+        summary_layout = QHBoxLayout(summary)
+        summary_layout.setContentsMargins(14, 12, 14, 12)
+        summary_layout.setSpacing(12)
+
+        score_col = QVBoxLayout()
+        score_col.setContentsMargins(0, 0, 0, 0)
+        score_col.setSpacing(1)
+        if job.get("match_score") is not None:
+            score_text = f"{job['match_score']}%"
+            score_note = "Final match"
+        elif job.get("rule_score") is not None:
+            score_text = f"~{job['rule_score']}%"
+            score_note = "Preliminary match"
+        else:
+            score_text = "—"
+            score_note = "Not analyzed"
+        score = QLabel(score_text)
+        score.setObjectName("matchAnalysisScore")
+        note = QLabel(score_note)
+        note.setObjectName("matchAnalysisMuted")
+        score_col.addWidget(score)
+        score_col.addWidget(note)
+        summary_layout.addLayout(score_col)
+        summary_layout.addStretch(1)
+
+        recommendation_text = str(job.get("recommendation") or "Analyze to get recommendation")
+        recommendation = QLabel(recommendation_text)
+        recommendation.setObjectName("matchRecommendationBadge")
+        recommendation.setAlignment(Qt.AlignCenter)
+        recommendation.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        summary_layout.addWidget(recommendation, 0, Qt.AlignVCenter)
+        self._layout.addWidget(summary)
+
+        # Compact metadata row
+        metadata = QFrame()
+        metadata.setObjectName("matchAnalysisMeta")
+        meta_layout = QHBoxLayout(metadata)
+        meta_layout.setContentsMargins(2, 0, 2, 0)
+        meta_layout.setSpacing(14)
+        meta_values = [
+            ("Source", str(job.get("source") or "—").title()),
+            ("Posted", str(job.get("date_posted") or "Not stated")),
+            ("Start", str(facts.get("start_date") or "Not stated")),
+            ("Salary", str(job.get("salary") or "—")),
+        ]
+        for label, value in meta_values:
+            item = QLabel(f"<span style='color:#7a8494'>{html.escape(label)}</span>  {html.escape(value)}")
+            item.setObjectName("matchAnalysisMetaItem")
+            item.setTextFormat(Qt.RichText)
+            meta_layout.addWidget(item)
+        meta_layout.addStretch(1)
+        if job.get("url"):
+            link = QLabel(f"<a href='{html.escape(str(job['url']), quote=True)}'>Open Job Posting ↗</a>")
+            link.setObjectName("matchAnalysisLink")
+            link.setOpenExternalLinks(True)
+            meta_layout.addWidget(link)
+        self._layout.addWidget(metadata)
+
+        model = QLabel(f"Model: {job.get('model_used') or '—'}")
+        model.setObjectName("matchAnalysisModel")
+        self._layout.addWidget(model)
+
+        self._requirements_section("Education requirements", facts.get("education") or [], candidate_facts)
+        self._requirements_section("Other requirements", facts.get("other_requirements") or [], candidate_facts)
+
+        try:
+            strengths = json.loads(job.get("strengths_json") or "[]")
+        except Exception:
+            strengths = []
+        try:
+            missing = json.loads(job.get("missing_json") or "[]")
+        except Exception:
+            missing = []
+        try:
+            warnings = json.loads(job.get("risks_json") or "[]")
+        except Exception:
+            warnings = []
+
+        self._section("Strengths", strengths, tone="good", empty_text="Analyze this job to generate strengths.")
+        self._section("Missing", missing, tone="missing", empty_text="No missing qualifications identified yet.")
+        self._section("Warnings", warnings, tone="warning", empty_text="No warnings identified.")
+
+        reason = QFrame()
+        reason.setObjectName("matchReasonBox")
+        reason_layout = QVBoxLayout(reason)
+        reason_layout.setContentsMargins(13, 11, 13, 12)
+        reason_layout.setSpacing(5)
+        reason_title = QLabel("Summary")
+        reason_title.setObjectName("matchAnalysisSectionTitle")
+        reason_text = QLabel(str(job.get("match_reason") or "Analyze this job to generate a match summary."))
+        reason_text.setObjectName("matchReasonText")
+        reason_text.setWordWrap(True)
+        reason_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        reason_layout.addWidget(reason_title)
+        reason_layout.addWidget(reason_text)
+        self._layout.addWidget(reason)
+        self._layout.addStretch(1)
+
+
 class JobsPage(QWidget):
     changed = Signal()
     resume_ready = Signal()
 
     def __init__(self, db: Database, jobs: JobService, resumes: ResumeService, ai: AIManager):
         super().__init__(); self.db, self.service, self.resumes, self.ai = db, jobs, resumes, ai; self.current_job = None; self.worker = None; self.task_started_at = None
-        root = QVBoxLayout(self); root.setContentsMargins(22, 20, 22, 22); root.setSpacing(10); title_label = QLabel("<h1>Jobs</h1><p style='color:#6e6e73;margin-top:-7px'>Search, review and organize opportunities.</p>"); title_label.setMinimumHeight(74); root.addWidget(title_label)
-        controls = QHBoxLayout(); self.search_box = QLineEdit(); self.search_box.setPlaceholderText("Search company, position, location"); self.search_box.textChanged.connect(self.refresh)
-        self.score_filter = QComboBox(); self.score_filter.addItem("All matches", ""); self.score_filter.addItem("75+ Good", "75"); self.score_filter.addItem("60+ Possible", "60"); self.score_filter.addItem("Unscored", "unscored"); self.score_filter.currentTextChanged.connect(self.refresh)
-        self.status_filter = QComboBox(); self.status_filter.addItem("All statuses", ""); [self.status_filter.addItem(status, status) for status in STATUSES]; self.status_filter.currentTextChanged.connect(self.refresh)
-        self.location_filter = QComboBox(); self.location_filter.addItem("All locations", ""); [self.location_filter.addItem(location, location) for location in load_settings().get("search", {}).get("locations", [])]; self.location_filter.currentTextChanged.connect(self.refresh)
+        self._dirty = True
+        self._cached_jobs: list[dict] = []
+        self._filter_timer = QTimer(self); self._filter_timer.setSingleShot(True); self._filter_timer.setInterval(180); self._filter_timer.timeout.connect(self._render_cards)
+        root = QVBoxLayout(self); root.setContentsMargins(28, 24, 28, 28); root.setSpacing(12); title_label = QLabel("<h1>Job Match</h1><p style='color:#6e7786;margin-top:-7px'>Review saved jobs and focus on the strongest matches.</p>"); title_label.setMinimumHeight(62); root.addWidget(title_label)
+        toolbar = QWidget(); toolbar.setObjectName("jobMatchToolbar"); controls = QHBoxLayout(toolbar); controls.setContentsMargins(12, 10, 12, 10); controls.setSpacing(8); self.search_box = QLineEdit(); self.search_box.setPlaceholderText("Filter saved jobs by company, position, or location"); self.search_box.setFixedHeight(34); self.search_box.textChanged.connect(self._schedule_filter_refresh)
+        self.score_filter = QComboBox(); self.score_filter.addItem("All matches", ""); self.score_filter.addItem("75+ Good", "75"); self.score_filter.addItem("60+ Possible", "60"); self.score_filter.addItem("Unscored", "unscored"); self.score_filter.currentTextChanged.connect(self._schedule_filter_refresh)
+        self.status_filter = QComboBox(); self.status_filter.addItem("All statuses", ""); [self.status_filter.addItem(status, status) for status in STATUSES]; self.status_filter.currentTextChanged.connect(self._schedule_filter_refresh)
+        self.location_filter = QComboBox(); self.location_filter.addItem("All locations", ""); [self.location_filter.addItem(location, location) for location in load_settings().get("search", {}).get("locations", [])]; self.location_filter.currentTextChanged.connect(self._schedule_filter_refresh)
         self.source_filter = QComboBox(); self.source_filter.addItem("All sources", "")
         for key, label in SEARCH_SITES.items(): self.source_filter.addItem(label, key)
-        self.source_filter.addItem("Manual", "manual"); self.source_filter.addItem("Import", "import"); self.source_filter.currentTextChanged.connect(self.refresh)
+        self.source_filter.addItem("Manual", "manual"); self.source_filter.addItem("Import", "import"); self.source_filter.currentTextChanged.connect(self._schedule_filter_refresh)
         self.model = QComboBox(); self.refresh_models(); self.model.hide()
-        search_btn = QPushButton("Search Jobs"); search_btn.clicked.connect(self.run_search); add_btn = QPushButton("Add Job"); add_btn.clicked.connect(self.add_job); import_btn = QPushButton("Import"); import_btn.clicked.connect(self.import_jobs)
-        for w in (self.search_box, self.score_filter, self.status_filter, self.location_filter, self.source_filter, search_btn, add_btn, import_btn): controls.addWidget(w)
-        root.addLayout(controls)
-        selection_hint = QLabel("Tip: use Ctrl or Shift to select multiple jobs (maximum 20 per batch)."); root.addWidget(selection_hint)
-        split = QSplitter(); self.table = QTableWidget(0, 7); self.table.setHorizontalHeaderLabels(["Company", "Match", "Position", "Location", "Source", "Salary", "Status"]); self.table.horizontalHeader().setMinimumSectionSize(75)
-        for column in (1, 4, 5, 6): self.table.horizontalHeaderItem(column).setTextAlignment(Qt.AlignCenter)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows); self.table.setSelectionMode(QAbstractItemView.ExtendedSelection); self.table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table.setSortingEnabled(True); self.table.itemSelectionChanged.connect(self.show_selected)
-        detail = QWidget(); dl = QVBoxLayout(detail); self.detail_title = QLabel("Select a job"); self.detail_title.setWordWrap(True); self.detail = QTextEdit(); self.detail.setReadOnly(True); self.description = QTextEdit(); self.description.setReadOnly(True); self.detail_tabs = QTabWidget(); self.detail_tabs.addTab(self.detail, "Requirements && Match"); self.detail_tabs.addTab(self.description, "Full Description"); self.status = QComboBox(); self.status.addItems(STATUSES); self.status.currentTextChanged.connect(self.change_status)
-        actions = QHBoxLayout(); analyze = QPushButton("Analyze Selected"); analyze.clicked.connect(self.analyze); interested = QPushButton("Interested"); interested.clicked.connect(lambda: self.set_selected_status("Interested")); ignored = QPushButton("Ignored"); ignored.clicked.connect(lambda: self.set_selected_status("Ignored")); open_btn = QPushButton("Open Job Page"); open_btn.clicked.connect(self.open_job); fill_btn = QPushButton("Copy Form Fill Script"); fill_btn.clicked.connect(self.copy_form_fill_script)
-        for w in (analyze, interested, ignored, open_btn, fill_btn): actions.addWidget(w)
-        translation_controls = QHBoxLayout(); self.translate_button = QPushButton("Translate 中文"); self.translate_button.clicked.connect(self.translate_description); self.show_chinese = QCheckBox("Show Chinese"); self.show_chinese.setEnabled(False); self.show_chinese.stateChanged.connect(self.toggle_translation); self.translation_status = QLabel("Original text"); translation_controls.addWidget(self.translate_button); translation_controls.addWidget(self.show_chinese); translation_controls.addWidget(self.translation_status); translation_controls.addStretch()
-        dl.addWidget(self.detail_title); dl.addWidget(self.status); dl.addLayout(actions); dl.addLayout(translation_controls); dl.addWidget(self.detail_tabs)
-        split.addWidget(self.table); split.addWidget(detail); split.setSizes([650, 650]); root.addWidget(split); root.setStretch(3, 1)
-        self.progress = QLabel("AI: Ready" if ai.available_models() else "AI: Offline")
-        root.addWidget(self.progress); self.refresh()
+        add_btn = QPushButton("Add Job"); add_btn.clicked.connect(self.add_job); import_btn = QPushButton("Import"); import_btn.clicked.connect(self.import_jobs)
+        for widget in (self.score_filter, self.status_filter, self.location_filter, self.source_filter, add_btn, import_btn): widget.setFixedHeight(34)
+        controls.addWidget(self.search_box, 1)
+        for w in (self.score_filter, self.status_filter, self.source_filter, add_btn, import_btn): controls.addWidget(w)
+        root.addWidget(toolbar)
+        selection_hint = QLabel("Ctrl / Shift selects multiple jobs · max 20 per analysis"); selection_hint.setObjectName("jobMatchHint"); root.addWidget(selection_hint)
+        split = QSplitter(); split.setObjectName("jobMatchSplitter")
+        table_panel = QWidget(); table_panel.setObjectName("jobMatchPanel"); table_layout = QVBoxLayout(table_panel); table_layout.setContentsMargins(0, 0, 0, 0); table_layout.setSpacing(0)
+        self.job_list = QListWidget(); self.job_list.setObjectName("compactCardList")
+        self.job_list.setSelectionMode(QAbstractItemView.ExtendedSelection); self.job_list.setSpacing(4); self.job_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.job_list.itemSelectionChanged.connect(self.show_selected); table_layout.addWidget(self.job_list)
+        detail = QWidget(); detail.setObjectName("jobMatchPanel"); dl = QVBoxLayout(detail); dl.setContentsMargins(14, 14, 14, 14); dl.setSpacing(9); self.detail_title = QLabel("Select a job"); self.detail_title.setObjectName("jobMatchDetailTitle"); self.detail_title.setWordWrap(True); self.detail = MatchAnalysisPanel(); self.description = QTextEdit(); self.description.setReadOnly(True)
+
+        # Translation belongs to the description workflow rather than the primary
+        # Match actions. Keep it inside the Full Description tab so the top action
+        # row stays focused on Analyze / Interested.
+        description_page = QWidget(); description_page.setObjectName("jobDescriptionPage")
+        description_layout = QVBoxLayout(description_page); description_layout.setContentsMargins(0, 0, 0, 0); description_layout.setSpacing(7)
+        translation_controls = QHBoxLayout(); translation_controls.setContentsMargins(0, 0, 0, 0); translation_controls.setSpacing(7); translation_controls.addStretch()
+        self.translate_button = QPushButton("Translate 中文"); self.translate_button.clicked.connect(self.translate_description)
+        self.show_chinese = QCheckBox("Show Chinese"); self.show_chinese.setEnabled(False); self.show_chinese.stateChanged.connect(self.toggle_translation)
+        self.translation_status = QLabel("Original text"); self.translation_status.setObjectName("jobMatchHint")
+        translation_controls.addWidget(self.translation_status); translation_controls.addWidget(self.show_chinese); translation_controls.addWidget(self.translate_button)
+        description_layout.addLayout(translation_controls); description_layout.addWidget(self.description, 1)
+
+        self.detail_tabs = QTabWidget(); self.detail_tabs.addTab(self.detail, "Requirements && Match"); self.detail_tabs.addTab(description_page, "Full Description")
+        self.status = QComboBox(); self.status.addItems(STATUSES); self.status.setMaximumWidth(132); self.status.setFixedHeight(34); self.status.currentTextChanged.connect(self.change_status)
+
+        # Keep the job status and primary Match actions on one compact row.
+        actions = QHBoxLayout(); actions.setContentsMargins(0, 0, 0, 0); actions.setSpacing(8)
+        analyze = QPushButton("Analyze"); analyze.setObjectName("primaryButton"); analyze.clicked.connect(self.analyze)
+        interested = QPushButton("Interested"); interested.clicked.connect(lambda: self.set_selected_status("Interested"))
+        ignored = QPushButton("Ignored"); ignored.clicked.connect(lambda: self.set_selected_status("Ignored"))
+        for widget in (analyze, interested, ignored): widget.setFixedHeight(34)
+        more_btn = QToolButton(); more_btn.setObjectName("compactCardMenuButton"); more_btn.setText("•••"); more_btn.setToolTip("More actions"); more_btn.setCursor(Qt.PointingHandCursor)
+        detail_popup = CardActionPopup([
+            ("Open Job Posting", self.open_job),
+        ], self)
+        more_btn._card_popup = detail_popup
+        more_btn.clicked.connect(lambda _checked=False, b=more_btn, p=detail_popup: p.show_for(b))
+        actions.addWidget(self.status)
+        actions.addWidget(analyze)
+        actions.addWidget(interested)
+        actions.addWidget(ignored)
+        actions.addStretch()
+        actions.addWidget(more_btn)
+
+        dl.addWidget(self.detail_title); dl.addLayout(actions); dl.addWidget(self.detail_tabs)
+        split.addWidget(table_panel); split.addWidget(detail); split.setSizes([700, 600]); split.setChildrenCollapsible(False); root.addWidget(split); root.setStretch(root.indexOf(split), 1)
+        self.progress = QLabel(""); self.progress.setObjectName("jobMatchHint"); self.progress.hide(); root.addWidget(self.progress); self.refresh()
 
     def refresh_models(self):
         selected = self.model.currentText() if self.model.count() else load_settings().get("ai_mode", "Auto")
@@ -240,7 +759,7 @@ class JobsPage(QWidget):
 
     def filtered(self):
         normalize = lambda value: "".join(ch for ch in unicodedata.normalize("NFKD", str(value).casefold()) if not unicodedata.combining(ch))
-        jobs = self.db.jobs(); q = normalize(self.search_box.text()); score = self.score_filter.currentData(); status = self.status_filter.currentData(); location = normalize(self.location_filter.currentData() or ""); source = self.source_filter.currentData()
+        jobs = self._cached_jobs; q = normalize(self.search_box.text()); score = self.score_filter.currentData(); status = self.status_filter.currentData(); location = normalize(self.location_filter.currentData() or ""); source = self.source_filter.currentData()
         out = []
         for job in jobs:
             if q and q not in normalize(f"{job['company']} {job['title']} {job['location']}"): continue
@@ -254,29 +773,50 @@ class JobsPage(QWidget):
             out.append(job)
         return out
 
+    def mark_dirty(self):
+        self._dirty = True
+
+    def refresh_if_needed(self):
+        if self._dirty:
+            self.refresh()
+
+    def _schedule_filter_refresh(self, *_args):
+        self._filter_timer.start()
+
     def refresh(self):
-        selected_id = self.current_job["id"] if self.current_job else None
-        rows = self.filtered(); self.table.setSortingEnabled(False); self.table.setRowCount(len(rows)); self.table.setProperty("jobs", rows)
-        for r, job in enumerate(rows):
-            score = f"{job['match_score']}%" if job["match_score"] is not None else f"~{job['rule_score']}%" if job["rule_score"] is not None else "—"
-            for c, value in enumerate((job["company"], score, job["title"], job["location"], job["source"], job["salary"], job["status"])):
-                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, job["id"])
-                if c in (1, 4, 5, 6): item.setTextAlignment(Qt.AlignCenter)
-                if c == 1 and job["match_score"] is not None:
-                    item.setForeground(QColor("#15803d")); font = item.font(); font.setBold(True); item.setFont(font)
-                self.table.setItem(r, c, item)
-            if job["id"] == selected_id:
-                self.table.selectRow(r)
-        self.table.resizeColumnsToContents(); self.table.setColumnWidth(0, 150); self.table.setColumnWidth(1, 30); self.table.setColumnWidth(2, 450); self.table.setColumnWidth(3, 200); self.table.setColumnWidth(4, 30); self.table.setColumnWidth(5, 60); self.table.setColumnWidth(6, 30)
-        self.table.setSortingEnabled(True)
+        start = time.perf_counter()
+        query_start = time.perf_counter()
+        self._cached_jobs = self.db.job_summaries()
+        query_ms = (time.perf_counter() - query_start) * 1000
+        self._dirty = False
+        self._render_cards()
+        logger.debug("Match refresh total=%.1fms db=%.1fms rows=%d", (time.perf_counter() - start) * 1000, query_ms, len(self._cached_jobs))
+
+    def _render_cards(self):
+        start = time.perf_counter()
+        selected_ids = {item.data(Qt.UserRole) for item in self.job_list.selectedItems()}
+        if self.current_job: selected_ids.add(self.current_job["id"])
+        rows = self.filtered(); self.job_list.setUpdatesEnabled(False); self.job_list.blockSignals(True); self.job_list.clear(); current_item = None
+        for job in rows:
+            badge = f"{job['match_score']}%" if job["match_score"] is not None else f"~{job['rule_score']}%" if job["rule_score"] is not None else "Unscored"
+            tone = "good" if job["match_score"] is not None and job["match_score"] >= 60 else "neutral"
+            meta_parts = [part for part in (job.get("location"), str(job.get("source") or "").title(), job.get("status")) if part]
+            extra_parts = [part for part in (job.get("salary"),) if part]
+            item = add_compact_card(self.job_list, job["id"], primary=job.get("company") or "Unknown company", title=job.get("title") or "Untitled position", badge=badge, meta="  ·  ".join(meta_parts), extra="  ·  ".join(extra_parts), tone=tone, height=86 if extra_parts else 78)
+            if job["id"] in selected_ids:
+                item.setSelected(True)
+                if self.current_job and job["id"] == self.current_job["id"]: current_item = item
+        if current_item: self.job_list.setCurrentItem(current_item)
+        self.job_list.blockSignals(False); self.job_list.setUpdatesEnabled(True); self.job_list.viewport().update()
         if not rows and not self.current_job:
-            self.detail.setPlainText("No jobs yet.\nAdd, import, or search for a job to get started.")
+            self.detail.set_empty("No jobs yet. Add, import, or search for a job to get started.")
             self.description.clear()
+        logger.debug("Match card render=%.1fms visible_rows=%d", (time.perf_counter() - start) * 1000, len(rows))
 
     def show_selected(self):
-        row = self.table.currentRow()
-        if row < 0: return
-        job_id = self.table.item(row, 0).data(Qt.UserRole); self.current_job = self.db.job(job_id); j = self.current_job
+        item = self.job_list.currentItem()
+        if item is None: return
+        job_id = item.data(Qt.UserRole); self.current_job = self.db.job(job_id); j = self.current_job
         self.detail_title.setText(f"<h3>{j['title']}</h3><b>{j['company']}</b> · {j['location']}")
         self.status.blockSignals(True); self.status.setCurrentText(j["status"]); self.status.blockSignals(False)
         source_hash = hashlib.sha256(compact_job_text(j["description"]).encode("utf-8", "ignore")).hexdigest()
@@ -284,7 +824,6 @@ class JobsPage(QWidget):
         self.show_chinese.blockSignals(True); self.show_chinese.setEnabled(translation_ready)
         if not translation_ready: self.show_chinese.setChecked(False)
         self.show_chinese.blockSignals(False)
-        strengths = "\n".join("✓ " + x for x in json.loads(j["strengths_json"] or "[]")); missing = "\n".join("△ " + x for x in json.loads(j["missing_json"] or "[]")); risks = "\n".join("- " + x for x in json.loads(j["risks_json"] or "[]"))
         facts = extract_job_facts(j["title"], j["description"])
         try:
             resume_facts = self.resumes.candidate_context()
@@ -292,13 +831,7 @@ class JobsPage(QWidget):
             resume_facts = ""
         profile = load_settings().get("profile", {})
         candidate_facts = resume_facts + "\n" + "\n".join(str(value) for value in profile.values())
-        status_label = {"LIKELY_MET": "✓ Likely met", "NOT_CONFIRMED": "? Not confirmed", "DOES_NOT_MEET": "✗ Does not meet"}
-        def requirement_lines(values):
-            return "\n".join(f"{status_label[evaluate_requirement(value, candidate_facts)]} — {value}" for value in values) or "Not stated"
-        education = requirement_lines(facts["education"])
-        other_requirements = requirement_lines(facts["other_requirements"])
-        match = f"{j['match_score']}% (final)" if j["match_score"] is not None else f"~{j['rule_score']}% (preliminary rules only)" if j["rule_score"] is not None else "Not analyzed"
-        self.detail.setPlainText(f"Match: {match}\nRecommendation: {j['recommendation'] or 'Run Analyze for final recommendation'}\nModel: {j['model_used'] or '—'}\nSource: {j['source'] or '—'}\nPosted: {j['date_posted'] or 'Not stated'}\nStart date: {facts['start_date']}\nSalary: {j['salary'] or '—'}\nURL: {j['url'] or '—'}\n\nEducation requirement\n{education}\n\nOther requirements\n{other_requirements}\n\nStrengths\n{strengths or 'Run Analyze to generate'}\n\nMissing\n{missing or 'Run Analyze to generate'}\n\nWarnings\n{risks or 'Run Analyze to generate'}\n\nReason\n{j['match_reason'] or 'Run Analyze to generate'}")
+        self.detail.set_analysis(j, facts, candidate_facts)
         self.description.setPlainText(compact_job_text(j["translation_zh"] if translation_ready and self.show_chinese.isChecked() else j["description"]) or "No description available.")
         self.translation_status.setText(f"Chinese: {j.get('translation_model') or 'Ready'}" if translation_ready else "Original text")
 
@@ -307,14 +840,20 @@ class JobsPage(QWidget):
         seconds = max(0, round(seconds)); return f"{seconds // 60}:{seconds % 60:02d}"
 
     def busy(self, text):
-        self.progress.setText(translate(text))
+        self.progress.setText(translate(text)); self.progress.show()
+        logger.debug("task_progress_event %s", text)
         shell = self.window()
         if hasattr(shell, "update_task_state"):
             shell.update_task_state(translate(text), self.task_started_at)
         match = re.search(r"(?:Searching|Analyzing|Resume|Cover letter) (\d+)/(\d+):", text)
-        if not match or not self.task_started_at:
+        processed = re.search(r"Processed (\d+)/(\d+):", text)
+        if (not match and not processed) or not self.task_started_at:
             return
-        index, total = map(int, match.groups()); completed = max(0, index - 1); elapsed = time.monotonic() - self.task_started_at
+        if processed:
+            completed, total = map(int, processed.groups())
+        else:
+            index, total = map(int, match.groups()); completed = max(0, index - 1)
+        elapsed = time.monotonic() - self.task_started_at
         if completed:
             remaining = elapsed / completed * (total - completed)
             detail = translate(f"Progress {completed}/{total} · elapsed {self._duration(elapsed)} · about {self._duration(remaining)} remaining")
@@ -348,8 +887,7 @@ class JobsPage(QWidget):
         return True
 
     def selected_jobs(self) -> list[dict]:
-        indexes = self.table.selectionModel().selectedRows(0)
-        job_ids = list(dict.fromkeys(self.table.item(index.row(), 0).data(Qt.UserRole) for index in indexes))
+        job_ids = list(dict.fromkeys(item.data(Qt.UserRole) for item in self.job_list.selectedItems()))
         if not job_ids and self.current_job:
             job_ids = [self.current_job["id"]]
         return [job for job_id in job_ids if (job := self.db.job(job_id))]
@@ -370,15 +908,20 @@ class JobsPage(QWidget):
         return jobs
 
     def _analyze_many(self, jobs, resume, model, progress, cancelled):
-        completed, errors, models = 0, [], []
+        completed, processed, errors, models = 0, 0, [], []
         for index, job in enumerate(jobs, 1):
             if cancelled(): break
             progress(f"Analyzing {index}/{len(jobs)}: {job['company']} — {job['title']}")
             try:
-                result = self.service.analyze(job["id"], resume, model); completed += 1; models.append(result["model_used"])
+                result = self.service.analyze(job["id"], resume, model, progress=progress, cancelled=cancelled); completed += 1; models.append(result["model_used"]); processed += 1
+                progress(f"Processed {processed}/{len(jobs)}: {job['company']} — {job['title']}")
+            except AICancelled:
+                progress(f"Analysis cancelled before processing {index}/{len(jobs)}")
+                break
             except Exception as exc:
-                errors.append(f"{job['company']} — {job['title']}: {user_error_message(exc)}")
-        return {"completed": completed, "errors": errors, "models": list(dict.fromkeys(models)), "cancelled": cancelled()}
+                processed += 1; errors.append(f"{job['company']} — {job['title']}: {user_error_message(exc)}")
+                progress(f"Processed {processed}/{len(jobs)}: {job['company']} — {job['title']}")
+        return {"completed": completed, "processed": processed, "errors": errors, "models": list(dict.fromkeys(models)), "cancelled": cancelled()}
 
     def _optimize_many(self, jobs, model, progress, cancelled):
         completed, errors, versions = 0, [], []
@@ -397,10 +940,6 @@ class JobsPage(QWidget):
         if errors:
             message += "\n\n" + "\n".join(errors[:8])
         QMessageBox.information(self, title, message)
-
-    def run_search(self):
-        self.busy("Searching...")
-        self.run_task(self.service.search, lambda r: (self.busy("Search cancelled" if r.get("cancelled") else f"Search complete: {r['added']} new, {r['existing']} existing, {r['errors']} warnings"), self.refresh(), self.changed.emit()), with_progress=True)
 
     def add_job(self):
         dialog = JobDialog(self)
@@ -465,27 +1004,6 @@ class JobsPage(QWidget):
         if self.current_job:
             try: self.service.open_job(self.current_job)
             except Exception as exc: self.fail(str(exc))
-
-    def copy_form_fill_script(self):
-        if not self.current_job:
-            QMessageBox.information(self, "Form Fill Assistant", "Select a job first.")
-            return
-        values = form_fill_values(load_settings().get("profile", {}))
-        if not values:
-            QMessageBox.information(self, "Form Fill Assistant", "Add your contact details in Settings first.")
-            return
-        fields = ", ".join(CONTACT_FIELDS[key] for key in values)
-        message = (
-            "CareerOS will copy a temporary script containing these local values:\n"
-            f"{fields}\n\n"
-            "Open the application page yourself, then paste the script into that page's browser developer console and run it. "
-            "It fills only empty text fields. It cannot click, upload files, answer screening questions, or submit anything. "
-            "Review every field and submit manually. Continue?"
-        )
-        if QMessageBox.question(self, "Copy Form Fill Script", message) != QMessageBox.Yes:
-            return
-        QApplication.clipboard().setText(build_form_fill_script(load_settings().get("profile", {})))
-        QMessageBox.information(self, "Form Fill Script Copied", "The script is on your clipboard. Paste and run it only on the application page you are reviewing. CareerOS did not submit an application.")
 
     def change_status(self, status):
         if self.current_job: self.db.update_job(self.current_job["id"], status=status); self.current_job["status"] = status; self.refresh(); self.changed.emit()
@@ -627,20 +1145,31 @@ class ResumeEditorWindow(QMainWindow):
             QPushButton#editorDisclosureHeader:hover { background:#f0f5ff; color:#0a60c8; }
             QPushButton#editorDisclosureHeader:checked { background:#eef5ff; color:#0a60c8; border-bottom-left-radius:0; border-bottom-right-radius:0; }
             QWidget#editorDisclosureBody { background:#ffffff; border-top:1px solid #edf0f4; }
-            QPushButton { min-height:18px; padding:7px 14px; border:1px solid #d7dbe3; border-radius:9px; background:#ffffff; font-weight:500; color:#253044; }
+            QPushButton { min-height:34px; max-height:34px; padding:0 14px; border:1px solid #d7dbe3; border-radius:9px; background:#ffffff; font-weight:500; color:#253044; }
             QPushButton:hover { background:#f7faff; border-color:#88b9ff; }
             QPushButton:pressed { background:#e5f0ff; }
             QPushButton:disabled { color:#9a9aa0; background:#f1f1f3; border-color:#e0e0e3; }
-            QLineEdit,QTextEdit,QListWidget { border:1px solid #d7dbe3; border-radius:9px; padding:6px 9px; background:#fbfcfe; color:#1d1d1f; selection-background-color:#cfe3ff; }
+            QLineEdit { min-height:34px; max-height:34px; border:1px solid #d7dbe3; border-radius:9px; padding:0 10px; background:#fbfcfe; color:#1d1d1f; selection-background-color:#cfe3ff; }
+            QTextEdit,QListWidget { border:1px solid #d7dbe3; border-radius:9px; padding:6px 9px; background:#fbfcfe; color:#1d1d1f; selection-background-color:#cfe3ff; }
             QLineEdit:focus,QTextEdit:focus,QListWidget:focus { border:1px solid #0a84ff; }
             QGroupBox { background:#fbfcfe; border:1px solid #e1e5ec; border-radius:9px; margin-top:10px; padding-top:8px; font-weight:600; }
             QGroupBox::title { subcontrol-origin:margin; left:10px; padding:0 4px; color:#334155; }
             QLabel { background:transparent; color:#253044; }
             QGroupBox QLabel { color:#253044; }
             QPdfView { background:#e9edf3; border:1px solid #d8dde6; border-radius:10px; }
-            QScrollBar:vertical { background:transparent; width:10px; margin:4px; }
-            QScrollBar::handle:vertical { background:#bdc4d0; border-radius:5px; min-height:28px; }
-            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }
+            QScrollBar:vertical { background:#eef2f7; width:9px; margin:2px; border:none; border-radius:4px; }
+            QScrollBar::handle:vertical { background:#c4ccd8; border:none; border-radius:4px; min-height:32px; }
+            QScrollBar::handle:vertical:hover { background:#aeb8c7; }
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; border:none; background:transparent; }
+            QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical { background:transparent; }
+            QScrollBar:horizontal { background:#eef2f7; height:9px; margin:2px; border:none; border-radius:4px; }
+            QScrollBar::handle:horizontal { background:#c4ccd8; border:none; border-radius:4px; min-width:32px; }
+            QScrollBar::handle:horizontal:hover { background:#aeb8c7; }
+            QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal { width:0; border:none; background:transparent; }
+            QScrollBar::add-page:horizontal,QScrollBar::sub-page:horizontal { background:transparent; }
+            QSplitter::handle { background:#e6eaf0; }
+            QSplitter::handle:horizontal { width:1px; }
+            QSplitter::handle:vertical { height:1px; }
         """)
 
     def _snapshot_json(self) -> str:
@@ -1121,27 +1650,267 @@ class ResumeEditorWindow(QMainWindow):
             event.ignore()
 
 
+class EditorInfoPage(QWidget):
+    """Candidate/profile inputs shared by Resume, CV, matching, and form-fill workflows."""
+    changed = Signal()
+
+    def __init__(self, resumes: ResumeService, documents: SupportingDocumentService):
+        super().__init__()
+        self.resumes, self.documents = resumes, documents
+        self.settings = load_settings()
+        self.profile_fields = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+        layout.setContentsMargins(22, 18, 22, 24)
+        layout.setSpacing(8)
+        layout.setAlignment(Qt.AlignTop)
+        scroll.setWidget(body)
+        root.addWidget(scroll)
+
+        heading_row = QHBoxLayout()
+        heading = QLabel("<h1>Info</h1><p style='color:#6e7786;margin-top:-6px'>Candidate details and files used across matching, Resume, CV, and applications.</p>")
+        heading_row.addWidget(heading, 1)
+        self.autosave_status = QLabel("Saved")
+        self.autosave_status.setObjectName("infoSaveStatus")
+        self.autosave_status.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        heading_row.addWidget(self.autosave_status)
+        layout.addLayout(heading_row)
+
+        self.info_tabs = QTabWidget()
+        self.info_tabs.setObjectName("infoTabs")
+        self.info_tabs.setDocumentMode(True)
+        self.info_tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.info_tabs.currentChanged.connect(self._resize_info_tabs)
+        layout.addWidget(self.info_tabs, 0, Qt.AlignTop)
+
+        profile = self.settings.get("profile", {})
+
+        def make_field(key: str) -> QLineEdit:
+            field = QLineEdit(str(profile.get(key, "")))
+            field.setPlaceholderText("User-confirmed facts only")
+            self.profile_fields[key] = field
+            return field
+
+        def make_two_column_page(left_fields, right_fields):
+            page = QWidget()
+            outer = QVBoxLayout(page)
+            outer.setContentsMargins(0, 12, 0, 0)
+            outer.setSpacing(0)
+            surface = QWidget()
+            surface.setObjectName("infoTabSurface")
+            row = QHBoxLayout(surface)
+            row.setContentsMargins(16, 15, 16, 16)
+            row.setSpacing(24)
+
+            def build_form(items):
+                form = QFormLayout()
+                form.setContentsMargins(0, 0, 0, 0)
+                form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+                form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+                form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                form.setHorizontalSpacing(14)
+                form.setVerticalSpacing(10)
+                for key, label in items:
+                    form.addRow(label, make_field(key))
+                return form
+
+            left_wrap = QWidget(); left_wrap.setObjectName("infoFormColumn")
+            left_layout = QVBoxLayout(left_wrap); left_layout.setContentsMargins(0, 0, 0, 0)
+            left_layout.addLayout(build_form(left_fields))
+            row.addWidget(left_wrap, 1)
+
+            if right_fields:
+                right_wrap = QWidget(); right_wrap.setObjectName("infoFormColumn")
+                right_layout = QVBoxLayout(right_wrap); right_layout.setContentsMargins(0, 0, 0, 0)
+                right_layout.addLayout(build_form(right_fields))
+                row.addWidget(right_wrap, 1)
+
+            outer.addWidget(surface)
+            return page
+
+        # Basic application/contact details. Two-column layout mirrors how users
+        # scan application forms while keeping the existing data keys unchanged.
+        basic_left = [
+            ("first_name", "Legal first name"),
+            ("email", "Email address"),
+            ("address", "Street address"),
+            ("province", "Province / state"),
+            ("linkedin_url", "LinkedIn URL"),
+        ]
+        basic_right = [
+            ("last_name", "Legal last name"),
+            ("phone", "Phone number"),
+            ("city", "City"),
+            ("postal_code", "Postal / ZIP code"),
+            ("portfolio_url", "Portfolio URL"),
+        ]
+        self.info_tabs.addTab(make_two_column_page(basic_left, basic_right), "Basic Info")
+
+        career_left = [
+            ("skills", "Skills"),
+            ("experience", "Experience"),
+            ("languages", "Languages"),
+        ]
+        career_right = [
+            ("education", "Education"),
+            ("work_authorization", "Work authorization"),
+            ("licenses", "Licenses / certifications"),
+        ]
+        self.info_tabs.addTab(make_two_column_page(career_left, career_right), "Career Profile")
+
+        preference_left = [
+            ("desired_titles", "Desired job titles"),
+            ("preferred_locations", "Preferred locations"),
+            ("availability", "Availability"),
+        ]
+        preference_right = [
+            ("salary_preference", "Salary preference"),
+            ("additional_facts", "Additional verified facts"),
+        ]
+        self.info_tabs.addTab(make_two_column_page(preference_left, preference_right), "Preferences")
+
+        # Files remains a normal management view instead of a card list. It uses
+        # the same light surface/border language as the rest of CareerOS.
+        files_page = QWidget()
+        files_outer = QVBoxLayout(files_page)
+        files_outer.setContentsMargins(0, 12, 0, 0)
+        files_outer.setSpacing(12)
+
+        resume_surface = QWidget(); resume_surface.setObjectName("infoTabSurface")
+        resume_layout = QVBoxLayout(resume_surface); resume_layout.setContentsMargins(16, 14, 16, 14); resume_layout.setSpacing(9)
+        resume_layout.addWidget(QLabel("<b>Active Resume</b><br/><span style='color:#6e7786;font-size:11px'>DOCX source used for matching and Resume/CV generation.</span>"))
+        resume_row = QHBoxLayout(); resume_row.setSpacing(12)
+        self.resume_file_button = QPushButton("Select Resume File..."); self.resume_file_button.clicked.connect(self.import_resume)
+        self.resume_label = QLabel(); self.resume_label.setWordWrap(True); self.resume_label.setStyleSheet("color:#6e7786")
+        resume_row.addWidget(self.resume_file_button); resume_row.addWidget(self.resume_label, 1)
+        resume_layout.addLayout(resume_row)
+        files_outer.addWidget(resume_surface)
+        self.refresh_resume_label()
+
+        material_surface = QWidget(); material_surface.setObjectName("infoTabSurface")
+        material_layout = QVBoxLayout(material_surface); material_layout.setContentsMargins(16, 14, 16, 14); material_layout.setSpacing(9)
+        material_layout.addWidget(QLabel("<b>Additional materials</b><br/><span style='color:#6e7786;font-size:11px'>Supporting files available to analysis and draft generation when readable.</span>"))
+        self.materials = QListWidget(); self.materials.setObjectName("infoMaterialsList"); self.materials.setMinimumHeight(150)
+        material_layout.addWidget(self.materials)
+        material_buttons = QHBoxLayout(); material_buttons.setSpacing(8)
+        add_material = QPushButton("Add Files..."); add_material.clicked.connect(self.add_materials)
+        remove_material = QPushButton("Remove Selected"); remove_material.clicked.connect(self.remove_material)
+        material_buttons.addWidget(add_material); material_buttons.addWidget(remove_material); material_buttons.addStretch()
+        material_layout.addLayout(material_buttons)
+        files_outer.addWidget(material_surface)
+        files_outer.addStretch()
+        self.info_tabs.addTab(files_page, "Files")
+        self.refresh_materials()
+        QTimer.singleShot(0, self._resize_info_tabs)
+
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setSingleShot(True)
+        self.autosave_timer.timeout.connect(self.autosave)
+        for field in self.profile_fields.values():
+            field.textChanged.connect(self.schedule_autosave)
+
+    def _resize_info_tabs(self, *_):
+        """Keep the Info tabs attached to the heading instead of stretching vertically."""
+        page = self.info_tabs.currentWidget()
+        if page is None:
+            return
+        page.adjustSize()
+        tab_height = self.info_tabs.tabBar().sizeHint().height()
+        desired = page.sizeHint().height() + tab_height + 8
+        # Give Files enough room for its material list while keeping the profile
+        # tabs compact. The containing scroll area handles smaller windows.
+        desired = max(185, min(desired, 520))
+        self.info_tabs.setFixedHeight(desired)
+
+    def schedule_autosave(self, *_):
+        self.autosave_status.setText("Saving...")
+        self.autosave_timer.start(600)
+
+    def autosave(self):
+        settings = load_settings()
+        settings["profile"] = {key: field.text().strip() for key, field in self.profile_fields.items()}
+        save_settings(settings)
+        self.settings = settings
+        self.autosave_status.setText("Saved")
+        self.changed.emit()
+
+    def import_resume(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Choose Original Resume", "", "Word Documents (*.docx)")
+        if not path: return
+        try:
+            extracted = self.resumes.import_original(path); self.refresh_resume_label(); self.changed.emit()
+            QMessageBox.information(self, "Resume", f"Imported safely. Local resume text extracted to:\n{extracted}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Resume import", str(exc))
+
+    def refresh_resume_label(self):
+        source = self.resumes.imported_source_path()
+        self.resume_label.setText(f"Selected: {source.name}" if source else "No resume selected yet.")
+
+    def refresh_materials(self):
+        self.materials.clear()
+        for record in self.documents.db.supporting_documents():
+            status = "AI-ready" if record["extraction_status"] == "ready" else "stored; not readable"
+            item = QListWidgetItem(f"{record['original_name']}  ·  {status} ({record['character_count']:,} chars)")
+            item.setData(Qt.UserRole, record["id"]); self.materials.addItem(item)
+
+    def add_materials(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add Supporting Files", "", "All files (*.*)")
+        if not paths: return
+        imported, unreadable = 0, []
+        for path in paths:
+            try:
+                result = self.documents.import_file(path); imported += 1
+                if result["status"] != "ready": unreadable.append(result["name"])
+            except Exception as exc: unreadable.append(f"{Path(path).name}: {exc}")
+        self.refresh_materials(); self.changed.emit(); note = f"Added {imported} file(s)."
+        if unreadable: note += "\n\nStored but not usable by AI:\n" + "\n".join(unreadable[:8])
+        QMessageBox.information(self, "Additional Materials", note)
+
+    def remove_material(self):
+        item = self.materials.currentItem()
+        if not item: return
+        if QMessageBox.question(self, "Remove file", "Remove this stored additional file?") == QMessageBox.Yes:
+            self.documents.remove(item.data(Qt.UserRole)); self.refresh_materials(); self.changed.emit()
+
+    def refresh(self):
+        latest = load_settings().get("profile", {})
+        for key, field in self.profile_fields.items():
+            if not field.hasFocus(): field.setText(str(latest.get(key, "")))
+        self.refresh_resume_label(); self.refresh_materials()
+
+
 class ResumePage(QWidget):
     def __init__(self, db: Database, resumes: ResumeService):
         super().__init__(); self.db, self.service, self.current_version, self.worker = db, resumes, None, None
         self.original_content = ""
         self._original_preview_path: Path | None = None
         self._editor_windows: list[ResumeEditorWindow] = []
-        layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 22); layout.setSpacing(10); layout.addWidget(QLabel("<h1>Resume & CV</h1><p style='color:#6e6e73;margin-top:-7px'>Review tailored Resume drafts and job-specific CV letters before approval.</p>")); buttons = QHBoxLayout(); self.open_file_button = QPushButton("Open Selected File…"); self.open_file_button.clicked.connect(self.open_selected_file_menu); self.edit_button = QPushButton("Edit Resume"); self.edit_button.clicked.connect(self.edit_selected_resume); self.approve_button = QPushButton("Approve Version"); self.approve_button.clicked.connect(lambda: self.decide(True)); self.reject_button = QPushButton("Reject Version"); self.reject_button.clicked.connect(lambda: self.decide(False)); self.delete_button = QPushButton("Delete Selected Draft"); self.delete_button.clicked.connect(self.delete_selected_draft)
+        layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 22); layout.setSpacing(10); self.page_heading = QLabel("<h1>Resume</h1><p style='color:#6e6e73;margin-top:-7px'>Review and edit tailored Resume drafts before approval.</p>"); layout.addWidget(self.page_heading); buttons = QHBoxLayout(); self.open_file_button = QPushButton("Open Selected File…"); self.open_file_button.clicked.connect(self.open_selected_file_menu); self.edit_button = QPushButton("Edit Resume"); self.edit_button.clicked.connect(self.edit_selected_resume); self.approve_button = QPushButton("Approve Version"); self.approve_button.clicked.connect(lambda: self.decide(True)); self.reject_button = QPushButton("Reject Version"); self.reject_button.clicked.connect(lambda: self.decide(False)); self.delete_button = QPushButton("Delete Selected Draft"); self.delete_button.clicked.connect(self.delete_selected_draft)
         self.preview_zoom = QComboBox(); self.preview_zoom.addItems(["65%", "80%", "100%", "Fit width"]); self.preview_zoom.setCurrentText("80%")
         for w in (self.open_file_button, self.edit_button, self.approve_button, self.reject_button): w.setMaximumWidth(220); buttons.addWidget(w)
         buttons.addWidget(self.delete_button)
-        buttons.addWidget(QLabel("Preview")); buttons.addWidget(self.preview_zoom)
         buttons.addStretch()
-        layout.addLayout(buttons)
+        buttons.addWidget(QLabel("Preview")); buttons.addWidget(self.preview_zoom)
+        action_bar = QWidget(); action_bar.setObjectName("pageToolbar"); action_bar_layout = QHBoxLayout(action_bar); action_bar_layout.setContentsMargins(12, 8, 12, 8); action_bar_layout.setSpacing(7)
+        while buttons.count():
+            item = buttons.takeAt(0)
+            if item.widget(): action_bar_layout.addWidget(item.widget())
+            elif item.spacerItem(): action_bar_layout.addStretch()
+        layout.addWidget(action_bar)
         self.workspace_split = QSplitter(Qt.Horizontal); self.workspace_split.setChildrenCollapsible(False)
         info_panel = QWidget(); info_panel.setObjectName("resumeInfoPanel"); info_layout = QVBoxLayout(info_panel); info_layout.setContentsMargins(0, 0, 7, 0); info_layout.setSpacing(9)
         preview_panel = QWidget(); preview_layout = QVBoxLayout(preview_panel); preview_layout.setContentsMargins(7, 0, 0, 0); preview_layout.setSpacing(0)
         self.workspace_split.addWidget(info_panel); self.workspace_split.addWidget(preview_panel); self.workspace_split.setSizes([440, 960]); self.workspace_split.setStretchFactor(0, 0); self.workspace_split.setStretchFactor(1, 1)
         self.resume_setup_toggle = QPushButton("Resume setup  ▸"); self.resume_setup_toggle.setCheckable(True); self.resume_setup_toggle.toggled.connect(lambda open_: self._toggle_section(self.resume_setup, self.resume_setup_toggle, "Resume setup", open_)); info_layout.addWidget(self.resume_setup_toggle)
         self.resume_setup = QWidget(); self.resume_setup.setObjectName("settingsCard"); setup_form = QFormLayout(self.resume_setup); setup_form.setContentsMargins(16, 12, 16, 12); setup_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow); setup_form.setVerticalSpacing(7)
-        setup_form.addRow(QLabel("<b>Active resume and document style</b><br/><span style='color:#6e6e73;font-size:11px'>Used for locally generated Resume and CV drafts.</span>"))
-        resume_row = QVBoxLayout(); self.resume_label = QLabel(); self.resume_label.setWordWrap(True); self.resume_file_button = QPushButton("Select Resume File..."); self.resume_file_button.clicked.connect(self.import_resume); resume_row.addWidget(self.resume_file_button); resume_row.addWidget(self.resume_label); setup_form.addRow("Active resume", resume_row)
+        setup_form.addRow(QLabel("<b>Document style</b><br/><span style='color:#6e6e73;font-size:11px'>Layout controls for locally generated Resume and CV drafts. Source Resume selection now lives in Editor > Info.</span>"))
         pdf_options = load_settings().get("resume_pdf", {}); self.resume_pdf_style = QComboBox(); self.resume_pdf_style.addItems(["Modern", "Classic", "Compact"]); self.resume_pdf_style.setCurrentText(str(pdf_options.get("style", "Modern")))
         self.resume_font_family = QComboBox(); self.resume_font_family.addItems(["Helvetica", "Times"]); self.resume_font_family.setCurrentText(str(pdf_options.get("font_family", "Helvetica")))
         self.resume_pdf_font_size = QSpinBox(); self.resume_pdf_font_size.setRange(8, 12); self.resume_pdf_font_size.setSuffix(" pt"); self.resume_pdf_font_size.setValue(int(pdf_options.get("font_size", 9)))
@@ -1161,11 +1930,12 @@ class ResumePage(QWidget):
         self.resume_prompt.setPlaceholderText("Example: Emphasize CAD, CFD, and aerospace design experience. Use concise technical language.")
         self.resume_prompt.setPlainText(str(prompts.get("general", prompts.get("resume", ""))))
         self.resume_prompt.setFixedHeight(72)
-        self.prompt_status = QLabel("Used for both Resume and CV. Saves automatically after you stop typing.")
-        self.prompt_status.setStyleSheet("color:#6e6e73")
+        # Keep autosave state internal; the visible Status row was redundant and
+        # made the setup card feel busier than the Info/Resume/CV pages.
+        self.prompt_status = QLabel()
+        self.prompt_status.hide()
         setup_form.addRow("Resume / CV Instructions", self.resume_prompt)
-        setup_form.addRow("Status", self.prompt_status)
-        info_layout.addWidget(self.resume_setup); self.resume_setup.hide(); self.refresh_resume_label()
+        info_layout.addWidget(self.resume_setup); self.resume_setup.hide()
         # Diagnostics remain internal and lazy-loaded only for support tooling.
         self.debug_toggle = QPushButton(); self.debug_toggle.hide()
         self.debug_panel = QWidget(); self.debug_panel.setObjectName("settingsCard"); debug_layout = QVBoxLayout(self.debug_panel); debug_layout.setContentsMargins(16, 12, 16, 12); debug_layout.setSpacing(7)
@@ -1179,7 +1949,7 @@ class ResumePage(QWidget):
             (getattr(control, "currentTextChanged", None) or getattr(control, "valueChanged")).connect(self.schedule_resume_options_save)
         self.prompt_timer = QTimer(self); self.prompt_timer.setSingleShot(True); self.prompt_timer.timeout.connect(self.save_generation_prompts); self.resume_prompt.textChanged.connect(self.schedule_prompt_save)
         self.interested_box = QWidget(); self.interested_box.setObjectName("settingsCard"); interested_layout = QVBoxLayout(self.interested_box); interested_layout.setContentsMargins(16, 12, 16, 12); interested_layout.setSpacing(7)
-        interested_layout.addWidget(QLabel("<b>Interested jobs</b><br/><span style='color:#6e6e73;font-size:11px'>Create a tailored Resume or a letter-style CV using the Resume, verified Settings information, and the selected job.</span>"))
+        interested_layout.addWidget(QLabel("<b>Interested jobs</b><br/><span style='color:#6e6e73;font-size:11px'>Choose a saved job to create a tailored draft using your Resume and verified Info.</span>"))
         self.interested_jobs = QListWidget(); self.interested_jobs.setObjectName("versionList"); self.interested_jobs.setMinimumHeight(115); interested_layout.addWidget(self.interested_jobs)
         info_layout.addWidget(self.interested_box, 1)
         self.versions = QListWidget(); self.versions.setObjectName("versionList"); self.versions.currentRowChanged.connect(self.select_resume_version)
@@ -1187,10 +1957,24 @@ class ResumePage(QWidget):
         self.document_lists = QTabWidget(); self.document_lists.setObjectName("documentLists"); self.document_lists.setMinimumHeight(130)
         self.document_lists.addTab(self.versions, "Resume Drafts")
         self.document_lists.addTab(self.cv_versions, "CV Drafts")
+        self.document_lists.tabBar().hide()
+
+        # Draft generation belongs to the draft section header, not to the tab
+        # corner.  The old corner-widget placement floated over the list edge
+        # once the tabs were hidden and looked visually detached.
+        drafts_card = QWidget(); drafts_card.setObjectName("settingsCard")
+        drafts_layout = QVBoxLayout(drafts_card); drafts_layout.setContentsMargins(16, 12, 16, 14); drafts_layout.setSpacing(8)
+        drafts_header = QHBoxLayout(); drafts_header.setSpacing(8)
+        self.drafts_heading = QLabel("<b>Resume drafts</b><br/><span style='color:#6e6e73;font-size:11px'>Generated drafts stay local until you approve or export them.</span>")
+        drafts_header.addWidget(self.drafts_heading, 1)
         self.generate_draft_button = QPushButton("Generate Resume Draft")
+        self.generate_draft_button.setObjectName("primaryAction")
+        self.generate_draft_button.setMinimumWidth(170)
         self.generate_draft_button.clicked.connect(lambda: self.generate_interested("CV" if self.document_lists.currentIndex() == 1 else "Resume"))
-        self.document_lists.setCornerWidget(self.generate_draft_button, Qt.TopRightCorner)
-        info_layout.addWidget(self.document_lists, 1)
+        drafts_header.addWidget(self.generate_draft_button, 0, Qt.AlignTop)
+        drafts_layout.addLayout(drafts_header)
+        drafts_layout.addWidget(self.document_lists, 1)
+        info_layout.addWidget(drafts_card, 1)
         self.document_stack = QStackedWidget(); self.resume_panel = QWidget(); resume_layout = QVBoxLayout(self.resume_panel); resume_layout.setContentsMargins(0, 0, 0, 0)
         self.resume_tabs = QTabWidget(); self.original_pdf, self.modified_pdf = QPdfDocument(self), QPdfDocument(self); self.original_view, self.modified_view = QPdfView(), QPdfView(); self.original_view.setDocument(self.original_pdf); self.modified_view.setDocument(self.modified_pdf)
         for view in (self.original_view, self.modified_view): view.setPageMode(QPdfView.PageMode.MultiPage)
@@ -1198,7 +1982,23 @@ class ResumePage(QWidget):
         self.resume_tabs.addTab(self.original_view, "Original Resume Preview"); self.resume_tabs.addTab(self.modified_view, "Generated Resume Preview"); self.resume_tabs.addTab(comparison, "Compare Changes")
         resume_layout.addWidget(self.resume_tabs); self.document_stack.addWidget(self.resume_panel)
         self.cover_panel = QWidget(); cover_layout = QVBoxLayout(self.cover_panel); cover_layout.setContentsMargins(0, 0, 0, 0); self.cover_heading = QLabel("<h3>CV / Cover Letter Preview</h3>"); cover_layout.addWidget(self.cover_heading); self.cover_pdf = QPdfDocument(self); self.cover_view = QPdfView(); self.cover_view.setDocument(self.cover_pdf); self.cover_view.setPageMode(QPdfView.PageMode.MultiPage); cover_layout.addWidget(self.cover_view); self.document_stack.addWidget(self.cover_panel)
-        self.preview_zoom.currentTextChanged.connect(self.set_preview_zoom); self.set_preview_zoom(self.preview_zoom.currentText()); self.document_lists.currentChanged.connect(self.show_document_category); preview_layout.addWidget(self.document_stack, 1); layout.addWidget(self.workspace_split, 1); self.refresh(load_preview=False)
+        self.preview_zoom.currentTextChanged.connect(self.set_preview_zoom); self.set_preview_zoom(self.preview_zoom.currentText()); self.document_lists.currentChanged.connect(self.show_document_category); preview_layout.addWidget(self.document_stack, 1); layout.addWidget(self.workspace_split, 1); self.document_mode = "Resume"; self.set_document_mode("Resume", refresh=False); self.refresh(load_preview=False)
+
+    def set_document_mode(self, mode: str, refresh: bool = True):
+        """Expose one document workspace at a time for the Editor sidebar."""
+        self.document_mode = "CV" if str(mode).upper() == "CV" else "Resume"
+        index = 1 if self.document_mode == "CV" else 0
+        self.document_lists.setCurrentIndex(index)
+        if self.document_mode == "CV":
+            self.page_heading.setText("<h1>CV</h1><p style='color:#6e6e73;margin-top:-7px'>Review and edit job-specific CV / cover-letter drafts before approval.</p>")
+            self.resume_setup_toggle.setText("CV setup  ▸" if not self.resume_setup_toggle.isChecked() else "CV setup  ▾")
+            self.drafts_heading.setText("<b>CV drafts</b><br/><span style='color:#6e6e73;font-size:11px'>Generated CV drafts stay local until you approve or export them.</span>")
+        else:
+            self.page_heading.setText("<h1>Resume</h1><p style='color:#6e6e73;margin-top:-7px'>Review and edit tailored Resume drafts before approval.</p>")
+            self.resume_setup_toggle.setText("Resume setup  ▸" if not self.resume_setup_toggle.isChecked() else "Resume setup  ▾")
+            self.drafts_heading.setText("<b>Resume drafts</b><br/><span style='color:#6e6e73;font-size:11px'>Generated drafts stay local until you approve or export them.</span>")
+        self.show_document_category(index)
+        if refresh: self.refresh()
 
     @staticmethod
     def _toggle_section(section: QWidget, button: QPushButton, title: str, open_: bool) -> None:
@@ -1785,63 +2585,338 @@ class ResumePage(QWidget):
             QMessageBox.critical(self, "DOCX Export", str(exc))
 
 
-class ApplicationsPage(QWidget):
+class ApplicationApplyPage(QWidget):
+    """Interested-job staging area. Nothing here submits an application."""
+    changed = Signal()
     def __init__(self, db: Database):
-        super().__init__(); self.db = db; layout = QVBoxLayout(self); layout.setContentsMargins(22, 20, 22, 22); layout.setSpacing(10); layout.addWidget(QLabel("<h1>Applications</h1><p style='color:#6e6e73;margin-top:-7px'>Tracking only. CareerOS never submits applications. Double-click an approved Resume or CV to open it.</p>")); self.table = QTableWidget(0, 8); self.table.setHorizontalHeaderLabels(["Company", "Position", "Match", "Status", "Start date", "Post date", "Resume", "CV"]); self.table.setSelectionBehavior(QAbstractItemView.SelectRows); self.table.setEditTriggers(QAbstractItemView.NoEditTriggers); self.table.cellDoubleClicked.connect(self.open_cell); self.table.itemSelectionChanged.connect(self.update_mark_button); layout.addWidget(self.table); actions = QHBoxLayout(); open_job = QPushButton("Open Job Page"); open_job.clicked.connect(self.open_job); self.mark_button = QPushButton("Mark Selected as Applied"); self.mark_button.clicked.connect(self.mark); actions.addWidget(open_job); actions.addWidget(self.mark_button); actions.addStretch(); layout.addLayout(actions); self.refresh()
+        super().__init__(); self.db = db; self._dirty = True
+        root = QVBoxLayout(self); root.setContentsMargins(22, 20, 22, 22); root.setSpacing(12)
+        root.addWidget(QLabel("<h1>Apply</h1><p style='color:#6e7786;margin-top:-7px'>Prepare the jobs you want to apply for.</p>"))
+
+        card = QWidget(); card.setObjectName("applicationCard"); card_layout = QVBoxLayout(card); card_layout.setContentsMargins(14, 12, 14, 14); card_layout.setSpacing(10)
+        header = QHBoxLayout(); header.addWidget(QLabel("<b>Ready to apply</b>")); header.addStretch(); self.count_label = QLabel(""); self.count_label.setObjectName("jobMatchHint"); header.addWidget(self.count_label); card_layout.addLayout(header)
+        self.job_list = QListWidget(); self.job_list.setObjectName("compactCardList"); self.job_list.setSelectionMode(QAbstractItemView.SingleSelection); self.job_list.setSpacing(4); self.job_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.job_list.itemDoubleClicked.connect(lambda _item: self.open_job()); card_layout.addWidget(self.job_list, 1)
+        actions = QHBoxLayout(); actions.setSpacing(8)
+        self.resume_button = QPushButton("Open Resume"); self.resume_button.clicked.connect(lambda: self.open_document("resume"))
+        self.cv_button = QPushButton("Open CV"); self.cv_button.clicked.connect(lambda: self.open_document("cv"))
+        self.open_button = QPushButton("Open Job Page"); self.open_button.clicked.connect(self.open_job)
+        self.form_fill_button = QPushButton("Form Fill Script"); self.form_fill_button.setToolTip("Copy the local form-fill helper script"); self.form_fill_button.clicked.connect(self.copy_form_fill_script)
+        self.mark_button = QPushButton("Mark as Applied"); self.mark_button.setObjectName("primaryButton"); self.mark_button.clicked.connect(self.mark_applied)
+        actions.addWidget(self.resume_button); actions.addWidget(self.cv_button); actions.addStretch(); actions.addWidget(self.form_fill_button); actions.addWidget(self.open_button); actions.addWidget(self.mark_button); card_layout.addLayout(actions)
+        root.addWidget(card, 1); self.refresh()
+
+    def _selected_job_id(self) -> int | None:
+        item = self.job_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def _selected_row(self) -> dict | None:
+        job_id = self._selected_job_id()
+        if job_id is None: return None
+        return next((row for row in self.db.interested_application_rows() if row["id"] == job_id), None)
+
+    def mark_dirty(self):
+        self._dirty = True
+
+    def refresh_if_needed(self):
+        if self._dirty:
+            self.refresh()
 
     def refresh(self):
-        jobs = self.db.application_rows(); self.table.setRowCount(len(jobs))
-        for r, j in enumerate(jobs):
-            start_date = j.get("start_date") or "Not stated"
-            post_date = (j["date_posted"] or "")[:10] or "—"
-            for c, value in enumerate((j["company"], j["title"], "—" if j["match_score"] is None else j["match_score"], j["status"], start_date, post_date, j["resume_version"] or "—", j.get("cv_version") or "—")):
-                item = QTableWidgetItem(str(value)); item.setData(Qt.UserRole, j["id"]); self.table.setItem(r, c, item)
-        self.update_mark_button()
+        start = time.perf_counter()
+        selected_id = self._selected_job_id() if hasattr(self, "job_list") else None
+        rows = self.db.interested_application_rows(); self._dirty = False; self.job_list.setUpdatesEnabled(False); self.job_list.clear(); selected_item = None
+        for job in rows:
+            match = "—" if job.get("match_score") is None else f"{job['match_score']}%"
+            resume = job.get("resume_version") or "Missing"; cv = job.get("cv_version") or "Missing"
+            extra = f"Resume: {resume}  ·  CV: {cv}"
+            job_id = int(job["id"])
+            item = add_compact_card(
+                self.job_list, job_id,
+                primary=job.get("company") or "Unknown company",
+                title=job.get("title") or "Untitled position",
+                badge=match, meta="Interested", extra=extra,
+                tone="good" if job.get("match_score") is not None and job.get("match_score") >= 60 else "neutral", height=90,
+                menu_actions=[("Remove from Apply", lambda _checked=False, jid=job_id: self.remove_interested(jid))],
+            )
+            if job["id"] == selected_id: selected_item = item
+        self.count_label.setText(f"{len(rows)} job{'s' if len(rows) != 1 else ''}")
+        if selected_item: self.job_list.setCurrentItem(selected_item)
+        elif rows: self.job_list.setCurrentRow(0)
+        self.job_list.setUpdatesEnabled(True); self.job_list.viewport().update()
+        logger.debug("Apply refresh=%.1fms rows=%d", (time.perf_counter() - start) * 1000, len(rows))
 
-    def mark(self):
-        row = self.table.currentRow()
-        if row < 0:
+    def remove_interested(self, job_id: int):
+        job = self.db.job(job_id) or {}
+        label = f"{job.get('company') or ''} — {job.get('title') or ''}".strip(" —")
+        message = f"Remove {label or 'this job'} from Apply?\n\nIt will remain in Jobs > Match and can be marked Interested again later."
+        if QMessageBox.question(self, "Remove from Apply", message) != QMessageBox.Yes:
             return
-        job_id = self.table.item(row, 0).data(Qt.UserRole); job = self.db.job(job_id)
-        if job and job.get("status") == "Applied":
-            if QMessageBox.question(self, "Cancel Applied", "Cancel the local Applied mark and restore the previous status?") == QMessageBox.Yes:
-                self.db.unmark_applied(job_id); self.refresh()
-        elif QMessageBox.question(self, "Confirm", "Mark this job as manually applied?") == QMessageBox.Yes:
-            self.db.mark_applied(job_id); self.refresh()
+        self.db.update_job(job_id, status="New")
+        self.refresh(); self.changed.emit()
 
-    def update_mark_button(self):
-        row = self.table.currentRow()
-        if row < 0:
-            self.mark_button.setText("Mark Selected as Applied")
+    def copy_form_fill_script(self):
+        job_id = self._selected_job_id()
+        if job_id is None:
+            QMessageBox.information(self, "Form Fill Assistant", "Select a job first.")
             return
-        job = self.db.job(self.table.item(row, 0).data(Qt.UserRole))
-        self.mark_button.setText("Unmark as Applied" if job and job.get("status") == "Applied" else "Mark Selected as Applied")
+        values = form_fill_values(load_settings().get("profile", {}))
+        if not values:
+            QMessageBox.information(self, "Form Fill Assistant", "Add your contact details in Editor > Info first.")
+            return
+        fields = ", ".join(CONTACT_FIELDS[key] for key in values)
+        message = (
+            "CareerOS will copy a temporary script containing these local values:\n"
+            f"{fields}\n\n"
+            "Open the application page yourself, then paste the script into that page's browser developer console and run it. "
+            "It fills only empty text fields. It cannot click, upload files, answer screening questions, or submit anything. "
+            "Review every field and submit manually. Continue?"
+        )
+        if QMessageBox.question(self, "Copy Form Fill Script", message) != QMessageBox.Yes:
+            return
+        QApplication.clipboard().setText(build_form_fill_script(load_settings().get("profile", {})))
+        QMessageBox.information(self, "Form Fill Script Copied", "The helper script is on your clipboard. CareerOS did not submit an application.")
+
+    def mark_applied(self):
+        job_id = self._selected_job_id()
+        if job_id is None:
+            QMessageBox.information(self, "Apply", "Select an interested job first."); return
+        if QMessageBox.question(self, "Mark as Applied", "Confirm that you manually submitted this application?") != QMessageBox.Yes: return
+        self.db.mark_applied(job_id); self.refresh(); self.changed.emit()
+        QMessageBox.information(self, "Application Tracker", "The job was moved to Applications > Tracker.")
 
     def open_job(self):
-        row = self.table.currentRow()
-        if row < 0:
-            QMessageBox.information(self, "Open Job Page", "Select an application first.")
-            return
-        job_id = self.table.item(row, 0).data(Qt.UserRole)
-        job = self.db.job(job_id)
-        url = str((job or {}).get("url") or "")
+        job_id = self._selected_job_id()
+        if job_id is None:
+            QMessageBox.information(self, "Open Job Page", "Select a job first."); return
+        job = self.db.job(job_id); url = str((job or {}).get("url") or "")
         if not url.startswith(("http://", "https://")):
-            QMessageBox.warning(self, "Open Job Page", "No valid job link was saved for this application.")
-            return
+            QMessageBox.warning(self, "Open Job Page", "No valid job link was saved for this job."); return
         QDesktopServices.openUrl(QUrl(url))
 
-    def open_cell(self, row: int, column: int):
-        if column not in {6, 7}:
-            self.open_job(); return
-        item = self.table.item(row, column)
-        name = item.text().strip() if item else ""
-        if not name or name == "—":
-            return
+    def open_document(self, kind: str):
+        row = self._selected_row()
+        if not row:
+            QMessageBox.information(self, "Approved document", "Select a job first."); return
+        name = str(row.get("resume_version" if kind == "resume" else "cv_version") or "").strip()
+        if not name:
+            QMessageBox.information(self, "Approved document", f"No approved {kind.upper() if kind == 'cv' else 'resume'} is attached to this job yet."); return
         path = get_paths().resumes_approved / f"{name}.pdf"
-        if path.is_file():
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if path.is_file(): QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        else: QMessageBox.information(self, "Approved document", "The approved PDF is not available locally. Regenerate and approve the draft again.")
+
+
+class ApplicationTrackerPage(QWidget):
+    """Manual application tracker with editable milestones and an event timeline."""
+    changed = Signal()
+    STATUS_OPTIONS = ["Applied", "Interview", "Offer", "Rejected", "Withdrawn"]
+
+    def __init__(self, db: Database):
+        super().__init__(); self.db = db; self.current_job_id: int | None = None; self._loading = False; self._dirty = True; self._cached_rows: list[dict] = []
+        root = QVBoxLayout(self); root.setContentsMargins(22, 20, 22, 22); root.setSpacing(12)
+        root.addWidget(QLabel("<h1>Tracker</h1><p style='color:#6e7786;margin-top:-7px'>Track applications, interviews and follow-ups.</p>"))
+
+        toolbar = QWidget(); toolbar.setObjectName("applicationToolbar"); bar = QHBoxLayout(toolbar); bar.setContentsMargins(12, 8, 12, 8); bar.setSpacing(8)
+        self.status_filter = QComboBox(); self.status_filter.addItems(["All statuses"] + self.STATUS_OPTIONS); self.status_filter.currentTextChanged.connect(self._render_cached_rows); bar.addWidget(self.status_filter)
+        self.sort_combo = QComboBox(); self.sort_combo.addItems(["Newest application", "Oldest application", "Company A–Z", "Status"]); self.sort_combo.currentTextChanged.connect(self._render_cached_rows); bar.addWidget(self.sort_combo); bar.addStretch()
+        root.addWidget(toolbar)
+
+        split = QSplitter(Qt.Horizontal)
+        list_card = QWidget(); list_card.setObjectName("applicationCard"); list_layout = QVBoxLayout(list_card); list_layout.setContentsMargins(12, 12, 12, 12); list_layout.setSpacing(8)
+        list_layout.addWidget(QLabel("<b>Applications</b>"))
+        self.job_list = QListWidget(); self.job_list.setObjectName("compactCardList"); self.job_list.setSelectionMode(QAbstractItemView.SingleSelection); self.job_list.setSpacing(4); self.job_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.job_list.itemSelectionChanged.connect(self.load_selected); list_layout.addWidget(self.job_list, 1)
+        split.addWidget(list_card)
+
+        details = QWidget(); details.setObjectName("applicationCard"); detail_layout = QVBoxLayout(details); detail_layout.setContentsMargins(14, 12, 14, 12); detail_layout.setSpacing(10)
+        self.detail_title = QLabel("<b>Application details</b><br/><span style='color:#6e6e73;font-size:11px'>Select an application to edit its manual tracking information.</span>"); detail_layout.addWidget(self.detail_title)
+        form = QFormLayout(); form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow); form.setHorizontalSpacing(14); form.setVerticalSpacing(8)
+        self.status = QComboBox(); self.status.addItems(self.STATUS_OPTIONS)
+        self.applied_at = QLineEdit(); self.applied_at.setPlaceholderText("YYYY-MM-DD")
+        self.interview_at = QLineEdit(); self.interview_at.setPlaceholderText("YYYY-MM-DD or leave blank")
+        self.contact = QLineEdit(); self.contact.setPlaceholderText("Recruiter / hiring manager / email")
+        self.follow_up = QLineEdit(); self.follow_up.setPlaceholderText("YYYY-MM-DD or reminder note")
+        self.notes = QTextEdit(); self.notes.setPlaceholderText("Notes about this application"); self.notes.setMaximumHeight(105)
+        form.addRow("Status", self.status); form.addRow("Application date", self.applied_at); form.addRow("Interview date", self.interview_at); form.addRow("Contact", self.contact); form.addRow("Follow-up", self.follow_up); form.addRow("Notes", self.notes); detail_layout.addLayout(form)
+        buttons = QHBoxLayout(); self.open_button = QPushButton("Open Job Page"); self.open_button.clicked.connect(self.open_job); self.save_button = QPushButton("Save Changes"); self.save_button.setObjectName("primaryButton"); self.save_button.clicked.connect(self.save_changes); buttons.addStretch(); buttons.addWidget(self.open_button); buttons.addWidget(self.save_button); detail_layout.addLayout(buttons)
+        # Keep application history, but present it as a lightweight collapsible
+        # timeline rather than another spreadsheet-like table.
+        self.timeline_toggle = QToolButton()
+        self.timeline_toggle.setObjectName("timelineToggle")
+        self.timeline_toggle.setCheckable(True)
+        self.timeline_toggle.setChecked(False)
+        self.timeline_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.timeline_toggle.setArrowType(Qt.RightArrow)
+        self.timeline_toggle.setText("Application timeline")
+        self.timeline_toggle.toggled.connect(self._set_timeline_expanded)
+        detail_layout.addWidget(self.timeline_toggle)
+
+        self.timeline_panel = QWidget()
+        self.timeline_panel.setObjectName("timelinePanel")
+        self.timeline_layout = QVBoxLayout(self.timeline_panel)
+        self.timeline_layout.setContentsMargins(10, 4, 6, 6)
+        self.timeline_layout.setSpacing(0)
+        self.timeline_panel.setVisible(False)
+        detail_layout.addWidget(self.timeline_panel)
+
+        self.timeline_show_all = QPushButton("Show all")
+        self.timeline_show_all.setObjectName("timelineShowAll")
+        self.timeline_show_all.setVisible(False)
+        self.timeline_show_all.clicked.connect(self._show_all_timeline_events)
+        detail_layout.addWidget(self.timeline_show_all, 0, Qt.AlignLeft)
+        self._timeline_events = []
+        self._timeline_show_all_events = False
+        split.addWidget(details); split.setStretchFactor(0, 3); split.setStretchFactor(1, 2); root.addWidget(split, 1); self.refresh()
+
+    @staticmethod
+    def _date_text(value: object) -> str:
+        text = str(value or "").strip()
+        return text[:10] if text else ""
+
+    def mark_dirty(self):
+        self._dirty = True
+
+    def refresh_if_needed(self):
+        if self._dirty:
+            self.refresh()
+
+    def refresh(self):
+        start = time.perf_counter()
+        self._cached_rows = self.db.application_rows(); self._dirty = False
+        self._render_cached_rows()
+        logger.debug("Tracker refresh=%.1fms rows=%d", (time.perf_counter() - start) * 1000, len(self._cached_rows))
+
+    def _render_cached_rows(self, *_args):
+        selected = self.current_job_id
+        rows = list(self._cached_rows); filter_status = self.status_filter.currentText() if hasattr(self, "status_filter") else "All statuses"
+        if filter_status != "All statuses": rows = [row for row in rows if row.get("application_status") == filter_status]
+        sort_mode = self.sort_combo.currentText() if hasattr(self, "sort_combo") else "Newest application"
+        if sort_mode == "Oldest application": rows.sort(key=lambda r: str(r.get("applied_at") or ""))
+        elif sort_mode == "Company A–Z": rows.sort(key=lambda r: (str(r.get("company") or "").casefold(), str(r.get("title") or "").casefold()))
+        elif sort_mode == "Status": rows.sort(key=lambda r: (str(r.get("application_status") or ""), str(r.get("company") or "").casefold()))
+        else: rows.sort(key=lambda r: str(r.get("applied_at") or ""), reverse=True)
+        self.job_list.setUpdatesEnabled(False); self.job_list.blockSignals(True); self.job_list.clear(); selected_item = None
+        for job in rows:
+            status = job.get("application_status") or "Applied"; applied = self._date_text(job.get("applied_at")) or "No date"
+            meta = f"{status}  ·  {applied}"
+            extras = []
+            if self._date_text(job.get("interview_at")): extras.append(f"Interview {self._date_text(job.get('interview_at'))}")
+            if job.get("follow_up"): extras.append(f"Follow-up {job.get('follow_up')}")
+            tone = "good" if status in {"Interview", "Offer"} else "neutral"
+            job_id = int(job["id"])
+            item = add_compact_card(
+                self.job_list, job_id,
+                primary=job.get("company") or "Unknown company",
+                title=job.get("title") or "Untitled position",
+                badge=status, meta=applied, extra="  ·  ".join(extras), tone=tone,
+                height=88 if extras else 80,
+                menu_actions=[("Move back to Apply", lambda _checked=False, jid=job_id: self.move_back_to_apply(jid))],
+            )
+            if job["id"] == selected: selected_item = item
+        if selected_item: self.job_list.setCurrentItem(selected_item)
+        elif rows: self.job_list.setCurrentRow(0)
+        self.job_list.blockSignals(False); self.job_list.setUpdatesEnabled(True); self.job_list.viewport().update()
+        if rows: self.load_selected()
+        else: self.clear_details()
+
+    def clear_details(self):
+        self.current_job_id = None; self.detail_title.setText("<b>Application details</b><br/><span style='color:#6e6e73;font-size:11px'>No tracked application selected.</span>"); self._timeline_events = []; self._timeline_show_all_events = False; self._render_timeline()
+        for widget in (self.status, self.applied_at, self.interview_at, self.contact, self.follow_up, self.notes): widget.setEnabled(False)
+        self.save_button.setEnabled(False); self.open_button.setEnabled(False)
+
+    def load_selected(self):
+        item = self.job_list.currentItem()
+        if item is None: self.clear_details(); return
+        job_id = item.data(Qt.UserRole); job = self.db.job(job_id); app = self.db.application(job_id)
+        if not app: self.clear_details(); return
+        self.current_job_id = job_id; self._loading = True
+        for widget in (self.status, self.applied_at, self.interview_at, self.contact, self.follow_up, self.notes): widget.setEnabled(True)
+        self.save_button.setEnabled(True); self.open_button.setEnabled(True)
+        self.detail_title.setText(f"<b>{html.escape(str((job or {}).get('company') or ''))} — {html.escape(str((job or {}).get('title') or ''))}</b><br/><span style='color:#6e6e73;font-size:11px'>Manual application details</span>")
+        idx = self.status.findText(str(app.get("status") or "Applied")); self.status.setCurrentIndex(max(0, idx)); self.applied_at.setText(self._date_text(app.get("applied_at"))); self.interview_at.setText(self._date_text(app.get("interview_at"))); self.contact.setText(str(app.get("contact") or "")); self.follow_up.setText(str(app.get("follow_up") or "")); self.notes.setPlainText(str(app.get("notes") or "")); self._loading = False; self.refresh_timeline()
+
+    def save_changes(self):
+        if self.current_job_id is None: return
+        self.db.update_application(self.current_job_id, status=self.status.currentText(), applied_at=self.applied_at.text().strip(), interview_at=self.interview_at.text().strip(), contact=self.contact.text().strip(), notes=self.notes.toPlainText().strip(), follow_up=self.follow_up.text().strip())
+        self.refresh(); self.refresh_timeline(); self.changed.emit()
+
+    def refresh_timeline(self):
+        self._timeline_show_all_events = False
+        self._timeline_events = self.db.application_events(self.current_job_id) if self.current_job_id is not None else []
+        self._render_timeline()
+
+    def _set_timeline_expanded(self, expanded: bool):
+        self.timeline_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.timeline_panel.setVisible(expanded)
+        self.timeline_show_all.setVisible(expanded and len(self._timeline_events) > 3 and not self._timeline_show_all_events)
+
+    def _clear_timeline_widgets(self):
+        while self.timeline_layout.count():
+            item = self.timeline_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _render_timeline(self):
+        self._clear_timeline_widgets()
+        total = len(self._timeline_events)
+        suffix = f"  ·  {total} event{'s' if total != 1 else ''}" if total else ""
+        self.timeline_toggle.setText(f"Application timeline{suffix}")
+        if not total:
+            empty = QLabel("No application events yet.")
+            empty.setObjectName("timelineEmpty")
+            self.timeline_layout.addWidget(empty)
         else:
-            QMessageBox.information(self, "Approved document", "The approved PDF is not available locally. Regenerate and approve the draft again.")
+            events = self._timeline_events if self._timeline_show_all_events else self._timeline_events[-3:]
+            for index, event in enumerate(reversed(events)):
+                row = QWidget()
+                row.setObjectName("timelineEvent")
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(0, 7, 0, 7)
+                row_layout.setSpacing(9)
+                dot = QLabel("●")
+                dot.setObjectName("timelineDot")
+                dot.setAlignment(Qt.AlignTop | Qt.AlignHCenter)
+                dot.setFixedWidth(12)
+                row_layout.addWidget(dot)
+                text_wrap = QWidget(); text_wrap.setObjectName("timelineTextWrap")
+                text_layout = QVBoxLayout(text_wrap); text_layout.setContentsMargins(0, 0, 0, 0); text_layout.setSpacing(2)
+                date_text = str(event.get("event_date") or "").strip()[:10]
+                event_text = html.escape(str(event.get("event_type") or "Event"))
+                details = html.escape(str(event.get("details") or "").strip())
+                title = QLabel(f"<b>{event_text}</b> <span style='color:#8a94a6;font-size:10px'>{html.escape(date_text)}</span>")
+                title.setObjectName("timelineEventTitle")
+                text_layout.addWidget(title)
+                if details:
+                    detail = QLabel(details)
+                    detail.setObjectName("timelineEventDetails")
+                    detail.setWordWrap(True)
+                    text_layout.addWidget(detail)
+                row_layout.addWidget(text_wrap, 1)
+                self.timeline_layout.addWidget(row)
+        expanded = self.timeline_toggle.isChecked()
+        self.timeline_panel.setVisible(expanded)
+        self.timeline_show_all.setText("Show recent" if self._timeline_show_all_events else "Show all")
+        self.timeline_show_all.setVisible(expanded and total > 3)
+
+    def _show_all_timeline_events(self):
+        self._timeline_show_all_events = not self._timeline_show_all_events
+        self._render_timeline()
+
+    def move_back_to_apply(self, job_id: int | None = None):
+        target_id = job_id if job_id is not None else self.current_job_id
+        if target_id is None: return
+        job = self.db.job(target_id) or {}
+        label = f"{job.get('company') or ''} — {job.get('title') or ''}".strip(" —")
+        message = f"Move {label or 'this application'} back to Apply?\n\nTracking details and timeline will be preserved in case you mark it as applied again."
+        if QMessageBox.question(self, "Move to Apply", message) != QMessageBox.Yes: return
+        if self.db.unmark_applied(target_id):
+            if self.current_job_id == target_id: self.current_job_id = None
+            self.refresh(); self.changed.emit()
+
+    def open_job(self):
+        if self.current_job_id is None: return
+        job = self.db.job(self.current_job_id); url = str((job or {}).get("url") or "")
+        if not url.startswith(("http://", "https://")): QMessageBox.warning(self, "Open Job Page", "No valid job link was saved for this application."); return
+        QDesktopServices.openUrl(QUrl(url))
 
 
 class SettingsPage(QWidget):
@@ -1859,10 +2934,36 @@ class SettingsPage(QWidget):
         saved_mode = self.settings.get("ai_mode", "Auto"); self._saved_ai_mode = "API" if str(saved_mode).startswith("API:") else str(saved_mode)
         self.detected_local_models = []
         self._populate_local_model_choices([])
-        self.local_model_status = QLabel("Detecting installed local models..."); self.local_model_status.setStyleSheet("color:#6e6e73")
+        self.local_model_status = QLabel("Detecting installed local models...")
+        self.local_model_status.setObjectName("localModelStatus")
         self.refresh_local_models_button = QPushButton("Refresh local models"); self.refresh_local_models_button.clicked.connect(self.detect_local_models)
-        local_model_actions = QHBoxLayout(); local_model_actions.addWidget(self.refresh_local_models_button); local_model_actions.addWidget(self.local_model_status); local_model_actions.addStretch()
+        local_model_actions = QHBoxLayout()
+        local_model_actions.setContentsMargins(0, 0, 0, 0)
+        local_model_actions.setSpacing(12)
+        local_model_actions.addWidget(self.refresh_local_models_button)
+        local_model_actions.addWidget(self.local_model_status)
+        local_model_actions.addStretch()
         self.fallback = QCheckBox("If the selected local model fails, try another detected local model once"); self.fallback.setChecked(self.settings["fallback_enabled"]); ai_form.addRow("Default AI", self.model); ai_form.addRow("", local_model_actions); ai_form.addRow("Local fallback", self.fallback)
+
+        local_form = section("Local AI models", "Models run only on this computer through Ollama. CareerOS never downloads a model unless you confirm it below.")
+        self.ollama_runtime_status = QLabel("Checking Ollama…"); self.ollama_runtime_status.setStyleSheet("color:#6e6e73")
+        self.install_ollama_button = QPushButton("Install Ollama automatically")
+        self.install_ollama_button.clicked.connect(self.install_ollama)
+        self.ollama_download_page_button = QPushButton("Open official Ollama download page")
+        self.ollama_download_page_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://ollama.com/download/windows")))
+        self.recommended_local_model = QComboBox()
+        for name, metadata in self.ai.local_model_catalog().items():
+            self.recommended_local_model.addItem(f"{metadata['label']} — {metadata['size']} — {metadata['vram']} — {metadata['description']}", name)
+        self.download_local_model_button = QPushButton("Download selected model")
+        self.download_local_model_button.setEnabled(False)
+        self.download_local_model_button.clicked.connect(self.download_local_model)
+        self.installed_local_model = QComboBox(); self.installed_local_model.setMinimumWidth(250)
+        self.delete_local_model_button = QPushButton("Delete selected local model")
+        self.delete_local_model_button.setEnabled(False)
+        self.delete_local_model_button.clicked.connect(self.delete_local_model)
+        local_download_actions = QHBoxLayout(); local_download_actions.addWidget(self.download_local_model_button); local_download_actions.addStretch()
+        local_delete_actions = QHBoxLayout(); local_delete_actions.addWidget(self.delete_local_model_button); local_delete_actions.addStretch()
+        local_form.addRow("Ollama", self.ollama_runtime_status); local_form.addRow("", self.install_ollama_button); local_form.addRow("", self.ollama_download_page_button); local_form.addRow("Recommended model", self.recommended_local_model); local_form.addRow("", local_download_actions); local_form.addRow("Installed models", self.installed_local_model); local_form.addRow("", local_delete_actions)
 
         api_form = section("External API", "Optional. Auto stays local; data is sent externally only when you choose API for an action.")
         self.api_card = api_form.parentWidget(); self.api_card.setObjectName("apiSettingsCard")
@@ -1873,37 +2974,18 @@ class SettingsPage(QWidget):
         saved_key = str(api.get("encrypted_key") or "")
         self.api_key.setPlaceholderText("Saved securely for this Windows account" if saved_key.startswith("dpapi:") else "Legacy key saved; use once or re-enter to upgrade" if saved_key else "Paste API key")
         self.clear_key_button = QPushButton("Clear saved API key"); self.clear_key_button.clicked.connect(self.clear_api_key)
-        self.api_controls = (self.api_enabled, self.api_url, self.api_model, self.api_key, self.clear_key_button)
-        api_form.addRow("API", self.api_enabled); api_form.addRow("Base URL", self.api_url); api_form.addRow("Model", self.api_model); api_form.addRow("API key", self.api_key); api_form.addRow("", self.clear_key_button)
+        self.test_api_button = QPushButton("Test external API")
+        self.test_api_button.clicked.connect(self.test_external_api)
+        self.api_test_status = QLabel("Sends only a short health-check message; no resume, job, or Settings profile data.")
+        self.api_test_status.setStyleSheet("color:#6e6e73")
+        self.api_controls = (self.api_enabled, self.api_url, self.api_model, self.api_key, self.clear_key_button, self.test_api_button)
+        api_form.addRow("API", self.api_enabled); api_form.addRow("Base URL", self.api_url); api_form.addRow("Model", self.api_model); api_form.addRow("API key", self.api_key); api_form.addRow("", self.clear_key_button); api_form.addRow("Connection", self.test_api_button); api_form.addRow("Test status", self.api_test_status)
         self.model.currentTextChanged.connect(self.update_api_controls); self.model.currentIndexChanged.connect(self.update_api_controls); self.model.activated.connect(self.update_api_controls)
         self.model.currentTextChanged.connect(lambda _value: QTimer.singleShot(0, self.update_api_controls)); self.update_api_controls(); QTimer.singleShot(0, self.update_api_controls); self.detect_local_models()
 
-        material_form = section("Additional materials", "Readable PDF, Word, Excel and text files support analysis and draft generation. Other files are stored but not guessed.")
-        self.materials = QListWidget(); self.materials.setMinimumHeight(105); materials_row = QVBoxLayout(); materials_row.addWidget(self.materials); material_buttons = QHBoxLayout(); add_material = QPushButton("Add Files..."); add_material.clicked.connect(self.add_materials); remove_material = QPushButton("Remove Selected"); remove_material.clicked.connect(self.remove_material); material_buttons.addWidget(add_material); material_buttons.addWidget(remove_material); material_buttons.addStretch(); materials_row.addLayout(material_buttons)
-        material_form.addRow("Extra files", materials_row); self.refresh_materials()
+        # Candidate identity, application-form fields, source Resume, and supporting files
+        # now live under Editor > Info. Settings is reserved for system-level choices.
 
-        contact_form = section("Application form details", "Optional local details for the Form Fill Assistant. It only fills fields after you manually run a copied script; it never submits.")
-        contact_labels = {key: label for key, label in CONTACT_FIELDS.items()}
-        profile_form = section("Verified candidate information", "Enter only facts you personally confirm. These stay local unless you choose API for an AI action.")
-        labels = {**contact_labels, "skills":"Skills", "education":"Education", "experience":"Experience", "work_authorization":"Work authorization", "languages":"Languages", "licenses":"Licenses / certifications", "availability":"Availability", "desired_titles":"Desired job titles", "preferred_locations":"Preferred locations", "salary_preference":"Salary preference", "additional_facts":"Additional verified facts"}
-        profile = self.settings.get("profile", {})
-        self.profile_fields = {}
-        for key, label in labels.items():
-            field = QLineEdit(str(profile.get(key, ""))); field.setPlaceholderText("User-confirmed facts only")
-            self.profile_fields[key] = field; (contact_form if key in contact_labels else profile_form).addRow(label, field)
-        search = self.settings.get("search", {})
-        search_form = section("Job search", "Search combines your locations and job types. It does not send applications.")
-        self.search_locations = QTextEdit(); self.search_locations.setFixedHeight(92); self.search_locations.setPlainText("\n".join(search.get("locations", [])))
-        self.search_queries = QTextEdit(); self.search_queries.setFixedHeight(92); self.search_queries.setPlainText("\n".join(search.get("queries", [])))
-        self.search_distance = QSpinBox(); self.search_distance.setRange(1, 500); self.search_distance.setSuffix(" miles"); self.search_distance.setValue(int(search.get("distance", 30)))
-        self.search_sites = {}
-        sites_widget = QWidget(); sites_layout = QHBoxLayout(sites_widget); sites_layout.setContentsMargins(0, 0, 0, 0); sites_layout.setSpacing(10)
-        for key, label in SEARCH_SITES.items():
-            checkbox = QCheckBox(label); checkbox.setChecked(key in search.get("sites", [])); checkbox.stateChanged.connect(self.update_search_summary); self.search_sites[key] = checkbox; sites_layout.addWidget(checkbox)
-        sites_layout.addStretch()
-        self.search_summary = QLabel(); self.search_summary.setStyleSheet("color:#6e6e73")
-        self.search_locations.textChanged.connect(self.update_search_summary); self.search_queries.textChanged.connect(self.update_search_summary)
-        search_form.addRow("Locations", self.search_locations); search_form.addRow("Job types", self.search_queries); search_form.addRow("Sources", sites_widget); search_form.addRow("Distance", self.search_distance); search_form.addRow("Search plan", self.search_summary); self.update_search_summary()
         match_form = section("Match score weighting", "Set how much the final score relies on repeatable resume rules versus AI analysis. The two values always total 100%. Re-run Analyze to apply a new split to existing jobs.")
         weights = self.settings.get("match_weights", {}); rule_value = max(0, min(100, int(weights.get("rule", 70))))
         weight_control = QWidget(); weight_layout = QVBoxLayout(weight_control); weight_layout.setContentsMargins(0, 2, 0, 2); weight_layout.setSpacing(4)
@@ -1920,7 +3002,7 @@ class SettingsPage(QWidget):
         credit = QLabel("<p style='color:#6e6e73;margin:4px 2px 0'>CareerOS is a local workspace for manual job discovery, review, and application preparation.</p>"); credit.setWordWrap(True); body_layout.addWidget(credit)
         version = QLabel("CareerOS v0.2.0"); version.setObjectName("versionLabel"); version.setAlignment(Qt.AlignCenter); body_layout.addWidget(version); body_layout.addStretch()
         self.autosave_timer = QTimer(self); self.autosave_timer.setSingleShot(True); self.autosave_timer.timeout.connect(self.autosave)
-        autosave_widgets = [self.language, self.model, self.fallback, self.api_enabled, self.api_url, self.api_model, self.api_key, *self.profile_fields.values(), self.search_locations, self.search_queries, self.search_distance, *self.search_sites.values()]
+        autosave_widgets = [self.language, self.model, self.fallback, self.api_enabled, self.api_url, self.api_model, self.api_key]
         for widget in autosave_widgets:
             signal = getattr(widget, "textChanged", None) or getattr(widget, "currentTextChanged", None) or getattr(widget, "stateChanged", None) or getattr(widget, "valueChanged", None)
             signal.connect(self.schedule_autosave)
@@ -1928,30 +3010,97 @@ class SettingsPage(QWidget):
     def clear_api_key(self):
         self.settings.setdefault("api", {})["encrypted_key"] = ""; self.api_key.clear(); self.api_key.setPlaceholderText("Paste API key"); self.schedule_autosave()
 
+    def test_external_api(self):
+        """Save the visible provider fields, then run a data-minimal provider check."""
+        if not self._collect_settings():
+            return
+        self.settings["data_dir"] = str(get_paths().data_dir.resolve()); save_settings(self.settings); self.ai.reload_settings()
+        self.test_api_button.setEnabled(False); self.api_test_status.setText("Testing external API…")
+        self.api_test_worker = TaskThread(self.ai.external_smoke_test)
+        def done(result):
+            self.test_api_button.setEnabled(True)
+            self.api_test_status.setText(f"Connected: {result['model']} · {result['elapsed_seconds']} s · reply: {str(result['content'])[:80]}")
+        def failed(error):
+            self.test_api_button.setEnabled(True)
+            self.api_test_status.setText("Connection test failed. Check the message and provider settings.")
+            QMessageBox.critical(self, "External API test", user_error_message(error))
+        self.api_test_worker.completed.connect(done); self.api_test_worker.failed.connect(failed); self.api_test_worker.start()
+
     @staticmethod
     def _set_combo_choices(combo: QComboBox, values: list[str], selected: str) -> None:
         combo.blockSignals(True); combo.clear(); combo.addItems(list(dict.fromkeys(value for value in values if value))); index = combo.findText(selected)
         combo.setCurrentIndex(index if index >= 0 else 0); combo.blockSignals(False)
 
     def _populate_local_model_choices(self, detected: list[str]) -> None:
-        configured = [str(self.settings["models"].get("deep", "")), str(self.settings["models"].get("fast", ""))]
         self.detected_local_models = list(dict.fromkeys(str(model).strip() for model in detected if str(model).strip()))
-        choices = self.detected_local_models or configured
-        self._set_combo_choices(self.model, ["Auto", *choices, "API"], self.model.currentText() or self._saved_ai_mode)
+        # Do not advertise stale configured names as installed local models.
+        # With no running local service, users should see only Auto and API.
+        self._set_combo_choices(self.model, ["Auto", *self.detected_local_models, "API"], self.model.currentText() or self._saved_ai_mode)
+        if hasattr(self, "installed_local_model"):
+            self.installed_local_model.blockSignals(True); self.installed_local_model.clear(); self.installed_local_model.addItems(self.detected_local_models); self.installed_local_model.blockSignals(False)
+            self.delete_local_model_button.setEnabled(bool(self.detected_local_models))
         self.update_api_controls()
 
     def detect_local_models(self):
         if getattr(self, "model_scan", None) and self.model_scan.isRunning():
             return
         self.refresh_local_models_button.setEnabled(False); self.local_model_status.setText("Detecting installed local models...")
-        self.model_scan = TaskThread(self.ai.available_models)
-        def done(models):
-            self._populate_local_model_choices(models)
+        self.model_scan = TaskThread(self.ai.local_runtime_info)
+        def done(info):
+            models = list(info.get("models", [])); self._populate_local_model_choices(models)
+            available = bool(info.get("available"))
+            self.ollama_runtime_status.setText(f"Running locally — Ollama {info.get('version', 'unknown')}." if available else "Not running. Install Ollama or start it, then refresh.")
+            self.install_ollama_button.setEnabled(not available)
+            self.download_local_model_button.setEnabled(available)
             self.local_model_status.setText(f"{len(models)} local model(s) detected." if models else "No local models detected; saved choices are shown.")
             self.refresh_local_models_button.setEnabled(True)
         def failed(_):
-            self.local_model_status.setText("Could not detect local models."); self.refresh_local_models_button.setEnabled(True)
+            self.ollama_runtime_status.setText("Could not check Ollama."); self.local_model_status.setText("Could not detect local models."); self.refresh_local_models_button.setEnabled(True)
         self.model_scan.completed.connect(done); self.model_scan.failed.connect(failed); self.model_scan.start()
+
+    def install_ollama(self):
+        message = "Install Ollama through Windows Package Manager now?\n\nWindows may show its own installation prompt. CareerOS will not download any AI model until you separately choose one below."
+        if QMessageBox.question(self, "Install Ollama", message) != QMessageBox.Yes:
+            return
+        self.install_ollama_button.setEnabled(False); self.ollama_runtime_status.setText("Installing Ollama…")
+        self.ollama_install_worker = TaskThread(self.ai.install_ollama, with_progress=True)
+        def progress(text): self.ollama_runtime_status.setText(text)
+        def done(_):
+            self.ollama_runtime_status.setText("Ollama installed. Waiting for its local service…"); QTimer.singleShot(2000, self.detect_local_models)
+        def failed(error):
+            self.install_ollama_button.setEnabled(True); self.ollama_runtime_status.setText("Ollama installation did not finish."); QMessageBox.critical(self, "Install Ollama", user_error_message(error))
+        self.ollama_install_worker.progress.connect(progress); self.ollama_install_worker.completed.connect(done); self.ollama_install_worker.failed.connect(failed); self.ollama_install_worker.start()
+
+    def download_local_model(self):
+        model = str(self.recommended_local_model.currentData() or "")
+        metadata = self.ai.local_model_catalog().get(model, {})
+        if not model or not metadata:
+            return
+        message = f"Download {metadata['label']} ({metadata['size']}) through the local Ollama service?\n\nThis downloads model files from Ollama. It does not upload your resume, jobs, or Settings data."
+        if QMessageBox.question(self, "Download local model", message) != QMessageBox.Yes:
+            return
+        self.download_local_model_button.setEnabled(False); self.delete_local_model_button.setEnabled(False); self.ollama_runtime_status.setText(f"Downloading {metadata['label']}…")
+        self.local_download_worker = TaskThread(self.ai.pull_local_model, model, with_progress=True)
+        def progress(text): self.ollama_runtime_status.setText(text)
+        def done(result):
+            self.ollama_runtime_status.setText(f"Downloaded {result['model']} locally."); self.detect_local_models()
+        def failed(error):
+            self.download_local_model_button.setEnabled(True); self.ollama_runtime_status.setText("Local model download failed."); QMessageBox.critical(self, "Local model download", user_error_message(error))
+        self.local_download_worker.progress.connect(progress); self.local_download_worker.completed.connect(done); self.local_download_worker.failed.connect(failed); self.local_download_worker.start()
+
+    def delete_local_model(self):
+        model = self.installed_local_model.currentText().strip()
+        if not model:
+            return
+        if QMessageBox.question(self, "Delete local model", f"Delete the local Ollama model '{model}'?\n\nThis removes its downloaded model files. It does not affect CareerOS drafts or resumes.") != QMessageBox.Yes:
+            return
+        self.delete_local_model_button.setEnabled(False); self.ollama_runtime_status.setText(f"Removing {model}…")
+        self.local_delete_worker = TaskThread(self.ai.delete_local_model, model)
+        def done(_):
+            self.ollama_runtime_status.setText(f"Removed {model}."); self.detect_local_models()
+        def failed(error):
+            self.delete_local_model_button.setEnabled(True); self.ollama_runtime_status.setText("Could not remove local model."); QMessageBox.critical(self, "Delete local model", user_error_message(error))
+        self.local_delete_worker.completed.connect(done); self.local_delete_worker.failed.connect(failed); self.local_delete_worker.start()
 
     def update_api_controls(self, *_):
         """Keep saved API data intact; only the actual API fields are disabled locally."""
@@ -1982,7 +3131,7 @@ class SettingsPage(QWidget):
         self.merge_database_button.setEnabled(False); self.autosave_status.setText("Merging database safely...")
         self.merge_worker = TaskThread(self.documents.db.merge_from, source)
         def done(result):
-            self.merge_database_button.setEnabled(True); self.autosave_status.setText("Database merge complete."); self.refresh_materials(); self.saved.emit()
+            self.merge_database_button.setEnabled(True); self.autosave_status.setText("Database merge complete."); self.saved.emit()
             QMessageBox.information(self, "Database merge complete", f"New jobs: {result['jobs']}\nExisting jobs matched: {result['jobs_existing']}\nNew drafts: {result['drafts']}\nExisting drafts skipped: {result['drafts_existing']}\nApplications merged: {result['applications']}\nSupporting documents copied: {result['supporting_documents']}\n\nBackup: {result['backup'] or 'No prior database needed backup'}")
         def failed(error):
             self.merge_database_button.setEnabled(True); self.autosave_status.setText("Database merge failed; current data was not replaced."); QMessageBox.critical(self, "Database merge", user_error_message(error))
@@ -1994,12 +3143,6 @@ class SettingsPage(QWidget):
             status = "AI-ready" if record["extraction_status"] == "ready" else "stored; not readable"
             item = QListWidgetItem(f"{record['original_name']}  -  {status} ({record['character_count']:,} chars)")
             item.setData(Qt.UserRole, record["id"]); self.materials.addItem(item)
-
-    def update_search_summary(self):
-        locations = [line.strip() for line in self.search_locations.toPlainText().splitlines() if line.strip()]
-        queries = [line.strip() for line in self.search_queries.toPlainText().splitlines() if line.strip()]
-        enabled_sites = sum(box.isChecked() for box in self.search_sites.values())
-        self.search_summary.setText(f"{len(locations)} location(s) × {len(queries)} job type(s) × {enabled_sites} source(s) = {len(locations) * len(queries) * enabled_sites} searches per run")
 
     def update_match_weight_summary(self):
         rule = self.rule_weight.value(); ai = 100 - rule
@@ -2022,18 +3165,11 @@ class SettingsPage(QWidget):
         primary = chosen if chosen not in {"", "Auto", "API"} else str(existing_models.get("deep", ""))
         backup = next((model for model in self.detected_local_models if model != primary), str(existing_models.get("fast", "")))
         self.settings["models"] = {"deep": primary, "fast": backup}
-        self.settings["profile"] = {key: field.text().strip() for key, field in self.profile_fields.items()}
+        self.settings["profile"] = load_settings().get("profile", self.settings.get("profile", {}))
         # Resume & CV owns these choices now. Preserve its latest independent save
         # when Settings auto-saves other values.
         self.settings["resume_pdf"] = load_settings().get("resume_pdf", self.settings.get("resume_pdf", {}))
         self.settings["match_weights"] = {"rule": self.rule_weight.value(), "ai": 100 - self.rule_weight.value()}
-        locations = [line.strip() for line in self.search_locations.toPlainText().splitlines() if line.strip()]
-        queries = [line.strip() for line in self.search_queries.toPlainText().splitlines() if line.strip()]
-        sites = [key for key, box in self.search_sites.items() if box.isChecked()]
-        if not locations or not queries or not sites:
-            self.autosave_status.setText("Auto-save paused: keep at least one location, job type, and source.")
-            return False
-        self.settings.setdefault("search", {})["locations"] = list(dict.fromkeys(locations)); self.settings["search"]["queries"] = list(dict.fromkeys(queries)); self.settings["search"]["sites"] = sites; self.settings["search"]["distance"] = self.search_distance.value()
         return True
 
     def autosave(self):
@@ -2085,20 +3221,35 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle("CareerOS"); self.resize(1380, 850); self.setFont(QFont("Segoe UI Variable Text", 10)); self.setWindowIcon(QIcon(self._logo(36)))
         self.db = Database(); self.ai = AIManager(self.db); self.jobs_service = JobService(self.db, self.ai); self.resume_service = ResumeService(self.db, self.ai); self.document_service = SupportingDocumentService(self.db)
         shell = QWidget(); shell.setObjectName("appShell"); self.setCentralWidget(shell); layout = QHBoxLayout(shell); layout.setContentsMargins(0, 0, 0, 0); layout.setSpacing(0)
-        sidebar = QWidget(); sidebar.setObjectName("sidebar"); sidebar_layout = QVBoxLayout(sidebar); sidebar_layout.setContentsMargins(12, 16, 12, 12); sidebar_layout.setSpacing(11); brand = QWidget(); brand.setObjectName("brand"); brand_layout = QHBoxLayout(brand); brand_layout.setContentsMargins(8, 4, 8, 8); brand_layout.setSpacing(9); brand_icon = QLabel(); brand_icon.setPixmap(self._logo(28)); brand_name = QLabel("<b>CareerOS</b><br/><span style='color:#64748b;font-size:10px'>Career workspace</span>"); brand_layout.addWidget(brand_icon); brand_layout.addWidget(brand_name); brand_layout.addStretch(); sidebar_layout.addWidget(brand)
-        self.nav = QListWidget(); self.nav.setObjectName("navList"); self.nav.addItems(["Dashboard", "Jobs", "Resume & CV", "Applications", "Settings"]); self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.nav.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.nav.setFixedHeight(250); sidebar_layout.addWidget(self.nav)
+        sidebar = QWidget(); sidebar.setObjectName("sidebar"); sidebar_layout = QVBoxLayout(sidebar); sidebar_layout.setContentsMargins(14, 16, 14, 12); sidebar_layout.setSpacing(0); brand = QWidget(); brand.setObjectName("brand"); brand_layout = QHBoxLayout(brand); brand_layout.setContentsMargins(8, 4, 8, 8); brand_layout.setSpacing(9); brand_icon = QLabel(); brand_icon.setPixmap(self._logo(28)); brand_name = QLabel("<b>CareerOS</b><br/><span style='color:#64748b;font-size:10px'>Career workspace</span>"); brand_layout.addWidget(brand_icon); brand_layout.addWidget(brand_name); brand_layout.addStretch(); sidebar_layout.addWidget(brand)
+        self.sidebar_groups: dict[str, dict[str, QWidget]] = {}; self.sidebar_links: dict[str, QPushButton] = {}; self.sidebar_destinations = {"dashboard-data": 0, "jobs-search": 1, "jobs-match": 2, "editor-info": 3, "editor-resume": 4, "editor-cv": 4, "applications-apply": 5, "applications-tracker": 6, "system-settings": 7}
+        nav_assets = Path(__file__).resolve().parents[1] / "assets"
+        icons = {
+            "dashboard": QIcon(str(nav_assets / "nav_dashboard.svg")),
+            "jobs": QIcon(str(nav_assets / "nav_jobs.svg")),
+            "editor": QIcon(str(nav_assets / "nav_editor.svg")),
+            "applications": QIcon(str(nav_assets / "nav_applications.svg")),
+            "system": QIcon(str(nav_assets / "nav_system.svg")),
+        }
+        for group_key, title, links in (("dashboard", "Dashboard", (("Data", "dashboard-data"),)), ("jobs", "Jobs", (("Search", "jobs-search"), ("Match", "jobs-match"))), ("editor", "Editor", (("Info", "editor-info"), ("Resume", "editor-resume"), ("CV", "editor-cv"))), ("applications", "Applications", (("Apply", "applications-apply"), ("Tracker", "applications-tracker"))), ("system", "System", (("Settings", "system-settings"),))):
+            sidebar_layout.addWidget(self._create_sidebar_group(group_key, title, icons[group_key], links))
         sidebar_layout.addStretch(1)
-        self.task_card = QWidget(); self.task_card.setObjectName("taskCard"); task_layout = QVBoxLayout(self.task_card); task_layout.setContentsMargins(10, 9, 10, 9); task_layout.setSpacing(5)
-        task_layout.addWidget(QLabel("<b>Current status</b>"))
-        self.global_task_text = QLabel("Ready"); self.global_task_text.setWordWrap(True); self.global_task_text.setObjectName("taskStatusText"); task_layout.addWidget(self.global_task_text)
-        self.global_task_progress = QProgressBar(); self.global_task_progress.setTextVisible(False); self.global_task_progress.setMaximumHeight(7); self.global_task_progress.hide(); task_layout.addWidget(self.global_task_progress)
-        self.global_task_detail = QLabel(""); self.global_task_detail.setWordWrap(True); self.global_task_detail.setStyleSheet("color:#6e7786;font-size:11px"); task_layout.addWidget(self.global_task_detail)
-        self.global_task_cancel = QPushButton("Cancel"); self.global_task_cancel.setEnabled(False); self.global_task_cancel.clicked.connect(self.cancel_active_task); task_layout.addWidget(self.global_task_cancel)
-        sidebar_layout.addWidget(self.task_card); sidebar.setFixedWidth(208)
-        right = QWidget(); right.setObjectName("rightPane"); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0, 0, 0, 0); right_layout.setSpacing(0); top_bar = QWidget(); top_bar.setObjectName("topBar"); top_bar.setFixedHeight(40); top_layout = QHBoxLayout(top_bar); top_layout.setContentsMargins(17, 0, 17, 0); top_label = QLabel("<b>CareerOS</b>"); top_label.setObjectName("topTitle"); top_layout.addWidget(top_label); top_layout.addStretch(); right_layout.addWidget(top_bar)
-        self.stack = QStackedWidget(); self.dashboard = DashboardPage(self.db); self.jobs = JobsPage(self.db, self.jobs_service, self.resume_service, self.ai); self.resume = ResumePage(self.db, self.resume_service); self.applications = ApplicationsPage(self.db); self.settings = SettingsPage(self.resume_service, self.document_service, self.ai)
-        for page in (self.dashboard, self.jobs, self.resume, self.applications, self.settings): self.stack.addWidget(page)
-        self.nav.currentRowChanged.connect(self.change_page); self.jobs.changed.connect(self.refresh_pages); self.jobs.resume_ready.connect(lambda: self.nav.setCurrentRow(2)); self.settings.saved.connect(self.settings_changed); right_layout.addWidget(self.stack); layout.addWidget(sidebar); layout.addWidget(right); self._configure_combo_popups(); self.wheel_focus_guard = WheelFocusGuard(self)
+        self.task_card = QWidget(); self.task_card.setObjectName("taskCard"); task_layout = QVBoxLayout(self.task_card); task_layout.setContentsMargins(10, 8, 10, 8); task_layout.setSpacing(2)
+        provider_row = QHBoxLayout(); provider_row.setSpacing(7); self.ai_provider_dot = QLabel("●"); self.ai_provider_dot.setObjectName("aiProviderDot"); self.ai_provider_label = QLabel("AI status"); self.ai_provider_label.setObjectName("aiProviderLabel"); self.ai_provider_label.setWordWrap(True); provider_row.addWidget(self.ai_provider_dot, 0, Qt.AlignTop); provider_row.addWidget(self.ai_provider_label, 1); task_layout.addLayout(provider_row)
+        # Keep task plumbing for workers, but do not permanently clutter the sidebar.
+        self.version_label = QLabel("CareerOS v0.2.0", self.task_card); self.version_label.hide()
+        # Internal task plumbing only. These widgets are intentionally never shown:
+        # page-local status labels own all visible progress so background work never
+        # creates an accidental top-level Qt window (for example a "pythonw" progress bar).
+        self.global_task_text = QLabel("Ready", self.task_card); self.global_task_text.hide()
+        self.global_task_progress = QProgressBar(self.task_card); self.global_task_progress.hide()
+        self.global_task_detail = QLabel("", self.task_card); self.global_task_detail.hide()
+        self.global_task_cancel = QPushButton("Cancel", self.task_card); self.global_task_cancel.setEnabled(False); self.global_task_cancel.hide(); self.global_task_cancel.clicked.connect(self.cancel_active_task)
+        sidebar_layout.addWidget(self.task_card); sidebar.setFixedWidth(232)
+        right = QWidget(); right.setObjectName("rightPane"); right_layout = QVBoxLayout(right); right_layout.setContentsMargins(0, 0, 0, 0); right_layout.setSpacing(0)
+        self.stack = QStackedWidget(); self.dashboard = DashboardPage(self.db); self.job_search = JobSearchPage(self.jobs_service); self.jobs = JobsPage(self.db, self.jobs_service, self.resume_service, self.ai); self.editor_info = EditorInfoPage(self.resume_service, self.document_service); self.resume = ResumePage(self.db, self.resume_service); self.application_apply = ApplicationApplyPage(self.db); self.application_tracker = ApplicationTrackerPage(self.db); self.settings = SettingsPage(self.resume_service, self.document_service, self.ai)
+        for page in (self.dashboard, self.job_search, self.jobs, self.editor_info, self.resume, self.application_apply, self.application_tracker, self.settings): self.stack.addWidget(page)
+        self.job_search.changed.connect(self._job_search_completed); self.job_search.settings_saved.connect(self._job_search_settings_saved); self.jobs.changed.connect(self._jobs_data_changed); self.jobs.resume_ready.connect(lambda: self.navigate_to("editor-resume")); self.settings.saved.connect(self.settings_changed); self.editor_info.changed.connect(self.editor_info_changed); self.application_apply.changed.connect(self._applications_data_changed); self.application_tracker.changed.connect(self._applications_data_changed); right_layout.addWidget(self.stack); layout.addWidget(sidebar); layout.addWidget(right); self._configure_combo_popups(); self.wheel_focus_guard = WheelFocusGuard(self)
         for widget in self.findChildren(QComboBox):
             widget.installEventFilter(self.wheel_focus_guard)
         for widget in self.findChildren(QSpinBox):
@@ -2107,34 +3258,106 @@ class MainWindow(QMainWindow):
             widget.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
         for widget in self.findChildren(QSlider):
             widget.installEventFilter(self.wheel_focus_guard)
-        self.nav.setCurrentRow(0); localize_widget_tree(self)
+        self.navigate_to("dashboard-data"); localize_widget_tree(self)
         check_icon = (Path(__file__).resolve().parents[1] / "assets" / "check.svg").as_posix()
         self.setStyleSheet("""
             QWidget{font-family:'Segoe UI Variable Text','Segoe UI';font-size:13px;color:#1d1d1f;background:#f6f7fb}
             QLabel{background:transparent} QMainWindow{background:#f6f7fb} QWidget#appShell{background:#f6f7fb;border-radius:12px}
-            QWidget#sidebar{background:#e1e5ee;border-top-left-radius:12px;border-bottom-left-radius:12px;border-right:1px solid #cbd1dc}
-            QWidget#taskCard{background:rgba(255,255,255,150);border:1px solid #cbd3df;border-radius:10px} QLabel#taskStatusText{font-size:11px;color:#334155}
+            QWidget#sidebar{background:#f7f9fc;border-top-left-radius:12px;border-bottom-left-radius:12px;border-right:1px solid #e2e7ef}
+            QWidget#taskCard{background:transparent;border:none} QLabel#taskStatusText{font-size:11px;color:#5f6f85}
+            QLabel#aiProviderLabel{color:#526176;font-size:11px} QLabel#versionLabel{color:#718096;font-size:11px}
             QWidget#brand{background:transparent} QWidget#rightPane{background:#f5f5f7;border-top-right-radius:12px;border-bottom-right-radius:12px}
-            QWidget#topBar{background:#e8ecf4;border-top-right-radius:12px;border-bottom:1px solid #d4d9e2} QLabel#topTitle{background:transparent;color:#26354b;font-family:'Segoe UI Variable Display','Segoe UI';font-size:14px}
-            QListWidget#navList{padding:3px 0;border:none;background:transparent;outline:none}
-            QListWidget#navList::item{padding:10px 12px;margin:2px 0;border-radius:9px;color:#27303d}
-            QListWidget#navList::item:hover{background:rgba(207,215,229,195)} QListWidget#navList::item:selected{background:#d6e8ff;color:#0969d9;font-weight:600}
+            
+            QWidget#sidebarGroup,QWidget#sidebarChildren{background:transparent;border:none}
+            QWidget#sidebarGroupHeader{min-height:36px;max-height:36px;border:none;background:transparent}
+            QLabel#sidebarGroupIcon{min-width:20px;max-width:20px;background:transparent} QLabel#sidebarGroupLabel{background:transparent;color:#182235;font-size:13px;font-weight:600}
+            QPushButton#sidebarChildButton{min-height:29px;max-height:29px;margin:0 0 1px 0;padding:3px 8px 3px 38px;border:none;border-radius:6px;background:transparent;text-align:left;color:#667085;font-size:12px;font-weight:400}
+            QPushButton#sidebarChildButton:hover{background:#e7ebf2;color:#344054} QPushButton#sidebarChildButton[active="true"]{background:#dcecff;color:#0969d9;font-weight:600;border-left:2px solid #3b82f6;padding-left:36px}
+            QWidget#applicationCard{background:#ffffff;border:1px solid #e2e7ef;border-radius:12px}
+            QWidget#applicationToolbar{background:transparent;border:none}
+            QPushButton#primaryButton{background:#3478f6;color:white;border:1px solid #3478f6;font-weight:600}
+            QPushButton#primaryButton:hover{background:#2868db;border-color:#2868db}
             QListWidget#versionList{background:rgba(255,255,255,220);border:1px solid rgba(210,210,215,190);border-radius:9px;padding:5px;outline:none}
-            QListWidget#versionList::item{color:#1d1d1f;padding:7px 9px;margin:1px;border-radius:6px}
-            QListWidget#versionList::item:hover{background:#f0f5ff} QListWidget#versionList::item:selected{background:#d9e9ff;color:#0a60c8}
-            QPushButton{min-height:18px;padding:7px 14px;border:1px solid #d7dbe3;border-radius:9px;background:#ffffff;font-weight:500;color:#253044}
+            QListWidget#versionList::item{color:#1d1d1f;padding:8px 10px;margin:3px 1px;border:1px solid #e5e9f0;border-radius:8px;background:#fbfcfe}
+            QListWidget#versionList::item:hover{background:#f6f9fd;border-color:#d7dee9} QListWidget#versionList::item:selected{background:#eaf2ff;border-color:#a9c8ff;color:#0a60c8}
+            QPushButton{min-height:34px;max-height:34px;padding:0 14px;border:1px solid #d7dbe3;border-radius:9px;background:#ffffff;font-weight:500;color:#253044}
             QPushButton:hover{background:#f7faff;border-color:#88b9ff} QPushButton:pressed{background:#e5f0ff} QPushButton:disabled{color:#9a9aa0;background:#f1f1f3;border-color:#e0e0e3}
-            QLineEdit,QComboBox,QTextEdit,QTableWidget,QSpinBox{border:1px solid #d7dbe3;border-radius:9px;padding:6px 9px;background:#ffffff;color:#1d1d1f;selection-background-color:#cfe3ff}
+            QToolButton#compactCardMenuButton{min-width:22px;max-width:22px;min-height:22px;max-height:22px;padding:0;border:none;border-radius:6px;background:transparent;color:#697586;font-size:13px;font-weight:600}
+            QToolButton#compactCardMenuButton:hover{background:#eef3f9;color:#344054}
+            QToolButton#compactCardMenuButton:pressed,QToolButton#compactCardMenuButton:checked{background:#e2ebf7;color:#1f5fae}
+            QToolButton#compactCardMenuButton::menu-indicator{image:none;width:0;height:0}
+            QWidget#cardActionPopup{background:transparent;border:none}
+            QFrame#cardActionSurface{background:#ffffff;border:1px solid #dfe5ee;border-radius:8px}
+            QPushButton#cardActionItem{min-height:20px;padding:6px 11px;border:none;border-radius:5px;background:transparent;color:#344054;text-align:left;font-weight:500}
+            QPushButton#cardActionItem:hover{background:#edf4ff;color:#0a60c8}
+            QPushButton#cardActionItem:pressed{background:#e1ecfb;color:#084f9f}
+            QMenu{background:#ffffff;color:#253044;border:1px solid #dfe5ee;padding:4px}
+            QMenu::item{background:transparent;border:none;padding:7px 18px 7px 9px;margin:1px 0;color:#344054}
+            QMenu::item:selected{background:#edf4ff;color:#0a60c8}
+            QMenu::item:disabled{color:#98a2b3}
+            QMenu::separator{height:1px;background:#e9edf3;margin:5px 7px}
+            QLineEdit,QComboBox,QSpinBox{min-height:34px;max-height:34px;border:1px solid #d7dbe3;border-radius:9px;padding:0 10px;background:#ffffff;color:#1d1d1f;selection-background-color:#cfe3ff}
+            QTextEdit,QTableWidget{border:1px solid #d7dbe3;border-radius:9px;padding:6px 9px;background:#ffffff;color:#1d1d1f;selection-background-color:#cfe3ff}
             QLineEdit:disabled,QComboBox:disabled,QTextEdit:disabled,QSpinBox:disabled{background:#e5e7eb;color:#9aa1ad;border-color:#d7dbe3}
             QLineEdit:focus,QComboBox:focus,QTextEdit:focus,QSpinBox:focus{border:1px solid #0a84ff}
             QComboBox{padding-right:27px} QComboBox::drop-down{border:none;width:25px} QComboBox QAbstractItemView,QComboBox QAbstractItemView::viewport{background:#ffffff;border:1px solid #c7cbd4;border-radius:7px;padding:4px;selection-background-color:#d9e9ff;outline:none;color:#1d1d1f} QComboBox QAbstractItemView::item{padding:6px 8px;background:#ffffff;color:#1d1d1f} QComboBox QAbstractItemView::item:selected{background:#d9e9ff;color:#0a60c8}
-            QHeaderView::section{padding:9px;background:#f6f7fb;color:#687386;border:none;border-bottom:1px solid #d7dbe3;font-weight:600}
-            QTableWidget{gridline-color:#e7e9ee;selection-background-color:#dcecff;selection-color:#1d1d1f;alternate-background-color:#fbfcfe}
+            QHeaderView{background:#f7f9fc;border:none}
+            QHeaderView::section{padding:8px 9px;background:#f7f9fc;color:#667085;border:none;border-bottom:1px solid #e6eaf0;font-weight:600}
+            QTableCornerButton::section{background:#f7f9fc;border:none;border-bottom:1px solid #e6eaf0}
+            QTableWidget{gridline-color:#edf0f4;selection-background-color:#dcecff;selection-color:#1d1d1f;alternate-background-color:#fbfcfe;outline:none}
             QTabWidget::pane{border:1px solid rgba(210,210,215,205);border-radius:9px;background:rgba(255,255,255,218);top:-1px}
             QTabBar::tab{background:rgba(236,236,240,190);border:1px solid rgba(210,210,215,205);border-bottom:none;border-top-left-radius:8px;border-top-right-radius:8px;padding:8px 13px;margin-right:3px;color:#3a3a3c}
             QTabBar::tab:selected{background:rgba(255,255,255,235);color:#0a60c8;font-weight:600}
             QLabel#statsCard{padding:18px;border:1px solid rgba(210,210,215,205);border-radius:12px;background:rgba(255,255,255,215)}
-            QWidget#metricCard,QWidget#dashboardPanel,QWidget#settingsCard{background:#ffffff;border:1px solid #dde1e8;border-radius:13px}
+            QWidget#metricCard,QWidget#dashboardPanel,QWidget#settingsCard,QWidget#pageToolbar{background:#ffffff;border:1px solid #dde1e8;border-radius:13px}
+            QPushButton#primaryAction{min-height:34px;max-height:34px;background:#2f6fed;color:white;border:1px solid #2f6fed;font-weight:600;padding:0 16px}
+            QPushButton#primaryAction:hover{background:#255fd0;border-color:#255fd0}
+            QPushButton#primaryAction:disabled{background:#dbe4f3;color:#8a98ad;border-color:#dbe4f3}
+            QWidget#jobSearchCard,QWidget#jobMatchPanel{background:#ffffff;border:1px solid #e2e7ef;border-radius:12px} QWidget#jobMatchToolbar{background:transparent;border:none}
+            QWidget#jobSearchCard QLabel,QWidget#jobSearchSources,QWidget#jobSearchSources QLabel,QWidget#jobMatchToolbar QLabel,QWidget#jobMatchPanel QLabel{background:transparent}
+                        QLabel#jobSearchSummary,QLabel#jobSearchStatus,QLabel#jobMatchHint{color:#6e7786;font-size:11px}
+            QLabel#jobMatchDetailTitle{color:#182235;font-size:14px;font-weight:600}
+            QScrollArea#matchAnalysisScroll{background:transparent;border:none}
+            QWidget#matchAnalysisBody{background:#ffffff}
+            QFrame#matchAnalysisSummary{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px}
+            QLabel#matchAnalysisScore{color:#1769d2;font-size:24px;font-weight:700}
+            QLabel#matchRecommendationBadge{background:#edf4ff;color:#1769d2;border:1px solid #c9ddff;border-radius:8px;padding:5px 9px;font-size:11px;font-weight:600}
+            QFrame#matchAnalysisMeta{background:transparent;border:none}
+            QLabel#matchAnalysisMetaItem,QLabel#matchAnalysisModel,QLabel#matchAnalysisMuted{color:#667085;font-size:11px;background:transparent}
+            QLabel#matchAnalysisModel{padding-left:2px}
+            QLabel#matchAnalysisLink{color:#1769d2;font-size:11px;background:transparent}
+            QLabel#matchAnalysisLink a{color:#1769d2;text-decoration:none}
+            QFrame#matchAnalysisSection{background:#ffffff;border:1px solid #e5e9f0;border-radius:10px}
+            QLabel#matchAnalysisSectionTitle{color:#182235;font-size:12px;font-weight:650;background:transparent}
+            QLabel#matchAnalysisRow_good{color:#254f36;background:transparent;font-size:11px}
+            QLabel#matchAnalysisRow_missing{color:#6f4b14;background:transparent;font-size:11px}
+            QLabel#matchAnalysisRow_warning{color:#7a3940;background:transparent;font-size:11px}
+            QLabel#matchAnalysisRow_neutral,QLabel#matchRequirementText{color:#344054;background:transparent;font-size:11px}
+            QWidget#matchRequirementRow{background:transparent}
+            QLabel#requirementBadge_good{background:#edf8f1;color:#267447;border:1px solid #cfead9;border-radius:7px;padding:3px 7px;font-size:10px;font-weight:600}
+            QLabel#requirementBadge_neutral{background:#f3f5f8;color:#667085;border:1px solid #e0e5ec;border-radius:7px;padding:3px 7px;font-size:10px;font-weight:600}
+            QLabel#requirementBadge_missing{background:#fff3e8;color:#9a5b13;border:1px solid #f2d8b8;border-radius:7px;padding:3px 7px;font-size:10px;font-weight:600}
+            QFrame#matchReasonBox{background:#f7f9fc;border:1px solid #e2e7ef;border-radius:10px}
+            QLabel#matchReasonText{color:#344054;background:transparent;font-size:11px;line-height:1.35}
+            QLabel#matchAnalysisEmpty{color:#667085;background:transparent;padding:16px;font-size:11px}
+            QPushButton#primaryButton{min-height:34px;max-height:34px;background:#2f6fed;border-color:#2f6fed;color:#ffffff;font-weight:600;padding:0 18px}
+            QPushButton#primaryButton:hover{background:#255fd1;border-color:#255fd1}
+            QTableWidget#jobMatchTable{border:none;border-radius:11px;background:#ffffff}
+            QSplitter#jobMatchSplitter::handle{background:#e6eaf0;width:1px}
+            QSplitter#jobMatchSplitter::handle:hover{background:#cfd6e2}
+            QListWidget#compactCardList{background:transparent;border:none;outline:none;padding:2px}
+            QListWidget#compactCardList::item{background:#ffffff;border:1px solid #e3e8ef;border-radius:10px;margin:2px 1px;padding:0}
+            QListWidget#compactCardList::item:hover{background:#f8fbff;border-color:#ced9e8}
+            QListWidget#compactCardList::item:selected{background:#eaf2ff;border:1px solid #9fc2ff;color:#172b4d}
+            QWidget#compactCard,QWidget#compactCard QLabel,QWidget#compactCardContent,QWidget#compactCardActions{background:transparent;border:none}
+            QLabel#compactCardPrimary{color:#172033;font-size:12px;font-weight:600}
+            QLabel#compactCardTitle{color:#344054;font-size:11px}
+            QLabel#compactCardMeta,QLabel#compactCardExtra{color:#7a8495;font-size:10px}
+            QLabel#compactCardBadge{background:#eef2f7;color:#435168;border-radius:9px;padding:3px 8px;font-size:12px;font-weight:700}
+            QLabel#compactCardBadge[tone="good"]{background:#e7f7ed;color:#0f7a3d}
+            QToolButton#compactCardMenuButton{min-width:22px;max-width:22px;min-height:22px;max-height:22px;padding:0;border:none;border-radius:6px;background:transparent;color:#697586;font-size:13px;font-weight:600}
+            QToolButton#compactCardMenuButton:hover{background:#edf2f8;color:#263244}
+            QToolButton#compactCardMenuButton::menu-indicator{image:none;width:0;height:0}
             QLabel#metricValue{background:transparent;color:#172f52;font-family:'Segoe UI Variable Display','Segoe UI';font-size:23px;font-weight:700}
             QLabel#metricCaption{background:transparent;color:#6e7786;font-size:11px}
             QListWidget#recentList{background:transparent;border:none;outline:none;padding:0}
@@ -2143,12 +3366,51 @@ class MainWindow(QMainWindow):
             QWidget#settingsCard QLabel,QWidget#apiSettingsCard QLabel{background:transparent} QWidget#settingsCard QLineEdit,QWidget#settingsCard QComboBox,QWidget#settingsCard QTextEdit,QWidget#settingsCard QSpinBox,QWidget#apiSettingsCard QLineEdit{background:#fbfcfe}
             QWidget#apiSettingsCard{background:#ffffff;border:1px solid #dde1e8;border-radius:13px}
             QWidget#apiSettingsCard[apiFieldsDisabled="true"]{background:#eceef2;border-color:#d7dbe3} QWidget#apiSettingsCard[apiFieldsDisabled="true"] QLabel{color:#8b93a1} QWidget#apiSettingsCard[apiFieldsDisabled="true"] QLineEdit{background:#e5e7eb;color:#9aa1ad;border-color:#d7dbe3}
-            QLabel#versionLabel{color:#94a0b1;font-size:11px;padding:8px 0 2px}
+            QLabel#versionLabel{color:#94a0b1;font-size:11px;padding:1px 0 2px} QLabel#aiProviderDot{color:#9aa1ad;font-size:15px} QLabel#aiProviderLabel{color:#4c5a6d;font-size:11px}
+            QTabWidget#infoTabs::pane{border:none;background:transparent;top:0}
+            QTabWidget#infoTabs QTabBar{qproperty-drawBase:0;background:transparent;border:none}
+            QTabWidget#infoTabs QTabBar::tab{background:transparent;border:none;border-bottom:2px solid transparent;border-radius:0;padding:7px 14px 8px;margin-right:4px;color:#667085;font-weight:500}
+            QTabWidget#infoTabs QTabBar::tab:hover{color:#344054;background:#f3f6fa;border-top-left-radius:7px;border-top-right-radius:7px}
+            QTabWidget#infoTabs QTabBar::tab:selected{background:transparent;color:#1769d2;font-weight:600;border-bottom:2px solid #3478f6}
+            QWidget#infoTabSurface{background:#ffffff;border:1px solid #dde3ec;border-radius:12px}
+            QWidget#infoTabSurface QLabel,QWidget#infoFormColumn{background:transparent;border:none}
+            QWidget#infoTabSurface QLineEdit{min-height:22px;background:#fbfcfe}
+            QLabel#infoSaveStatus{color:#8a94a6;font-size:11px;background:transparent;padding-right:2px}
+            QToolButton#timelineToggle{background:transparent;border:none;padding:5px 2px;color:#263244;font-weight:600;text-align:left}
+            QToolButton#timelineToggle:hover{color:#1769d2}
+            QWidget#timelinePanel,QWidget#timelineEvent,QWidget#timelineTextWrap{background:transparent;border:none}
+            QWidget#timelineEvent{border-bottom:1px solid #edf0f4}
+            QLabel#timelineDot{color:#4f8df7;font-size:9px;background:transparent}
+            QLabel#timelineEventTitle{color:#263244;background:transparent}
+            QLabel#timelineEventDetails{color:#6e7786;font-size:11px;background:transparent}
+            QLabel#timelineEmpty{color:#8a94a6;font-size:11px;padding:6px 0;background:transparent}
+            QPushButton#timelineShowAll{min-height:18px;max-height:22px;padding:2px 7px;border:none;background:transparent;color:#1769d2;font-size:11px}
+            QPushButton#timelineShowAll:hover{background:#eef5ff}
+            QListWidget#infoMaterialsList{background:#fbfcfe;border:1px solid #e1e6ed;border-radius:9px;padding:4px;outline:none}
+            QListWidget#infoMaterialsList::item{padding:7px 9px;border-radius:6px;color:#455268}
+            QListWidget#infoMaterialsList::item:hover{background:#f1f5fb}
+            QListWidget#infoMaterialsList::item:selected{background:#e6f0ff;color:#0a60c8}
             QSlider::groove:horizontal{height:7px;background:#d8dee8;border-radius:4px} QSlider::sub-page:horizontal{background:#4e8df7;border-radius:4px} QSlider::add-page:horizontal{background:#d8dee8;border-radius:4px} QSlider::handle:horizontal{width:17px;margin:-5px 0;border-radius:9px;background:#ffffff;border:2px solid #2878e8}
             QCheckBox{background:transparent;color:#394150;spacing:7px} QCheckBox::indicator{width:16px;height:16px;border:1px solid #bfc6d2;border-radius:4px;background:#ffffff} QCheckBox::indicator:checked{background:#2878e8;border-color:#2878e8;image:url(__CHECK_ICON__)}
-            QScrollArea,QScrollArea::viewport{border:none;background:#f6f7fb} QScrollBar:vertical{background:transparent;width:10px;margin:4px} QScrollBar::handle:vertical{background:#bdc4d0;border-radius:5px;min-height:28px} QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0}
+            QScrollArea,QScrollArea::viewport{border:none;background:#f6f7fb}
+            QScrollBar:vertical{background:#eef2f7;width:9px;margin:2px;border:none;border-radius:4px}
+            QScrollBar::handle:vertical{background:#c4ccd8;border:none;border-radius:4px;min-height:32px}
+            QScrollBar::handle:vertical:hover{background:#aeb8c7}
+            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;border:none;background:transparent}
+            QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent}
+            QScrollBar:horizontal{background:#eef2f7;height:9px;margin:2px;border:none;border-radius:4px}
+            QScrollBar::handle:horizontal{background:#c4ccd8;border:none;border-radius:4px;min-width:32px}
+            QScrollBar::handle:horizontal:hover{background:#aeb8c7}
+            QScrollBar::add-line:horizontal,QScrollBar::sub-line:horizontal{width:0;border:none;background:transparent}
+            QScrollBar::add-page:horizontal,QScrollBar::sub-page:horizontal{background:transparent}
+            QSplitter::handle{background:#e6eaf0}
+            QSplitter::handle:horizontal{width:1px}
+            QSplitter::handle:vertical{height:1px}
+            QSplitter::handle:hover{background:#cfd6e2}
+            QFrame[frameShape="4"],QFrame[frameShape="5"]{color:#e6eaf0;background:#e6eaf0;border:none;max-height:1px;max-width:1px}
+            QLabel#localModelStatus{color:#6e7786;padding-left:4px}
         """.replace("__CHECK_ICON__", check_icon))
-        QTimer.singleShot(0, self._apply_windows_backdrop)
+        QTimer.singleShot(0, self._apply_windows_backdrop); QTimer.singleShot(0, self.refresh_ai_provider_status)
 
     def closeEvent(self, event):
         scan = getattr(self.settings, "model_scan", None)
@@ -2182,11 +3444,99 @@ class MainWindow(QMainWindow):
         for combo in self.findChildren(QComboBox):
             popup = combo.view().window(); popup.setWindowFlag(Qt.FramelessWindowHint, True); popup.setAttribute(Qt.WA_StyledBackground, True); popup.setStyleSheet(popup_style)
 
+    def _create_sidebar_group(self, group_key: str, title: str, icon: QIcon, links: tuple[tuple[str, str], ...]) -> QWidget:
+        """Build sidebar navigation only; pages remain the existing page widgets."""
+        group = QWidget(); group.setObjectName("sidebarGroup"); group.setAttribute(Qt.WA_StyledBackground, True); layout = QVBoxLayout(group); layout.setContentsMargins(0, 0, 0, 8); layout.setSpacing(0)
+        header = QWidget(); header.setObjectName("sidebarGroupHeader"); header.setAttribute(Qt.WA_StyledBackground, True); header_layout = QHBoxLayout(header); header_layout.setContentsMargins(7, 0, 7, 0); header_layout.setSpacing(9)
+        icon_label = QLabel(); icon_label.setObjectName("sidebarGroupIcon"); icon_label.setPixmap(icon.pixmap(QSize(20, 20)))
+        title_label = QLabel(title); title_label.setObjectName("sidebarGroupLabel"); title_label.setProperty("_careeros_keep_english", True)
+        header_layout.addWidget(icon_label); header_layout.addWidget(title_label); header_layout.addStretch(); layout.addWidget(header)
+        children = QWidget(); children.setObjectName("sidebarChildren"); children.setAttribute(Qt.WA_StyledBackground, True); children_layout = QVBoxLayout(children); children_layout.setContentsMargins(0, 0, 0, 0); children_layout.setSpacing(0)
+        for label, destination in links:
+            child = QPushButton(label); child.setObjectName("sidebarChildButton"); child.setProperty("_careeros_keep_english", True); child.setCursor(Qt.PointingHandCursor); child.clicked.connect(lambda _checked=False, key=destination: self.navigate_to(key)); children_layout.addWidget(child); self.sidebar_links[destination] = child
+        layout.addWidget(children)
+        self.sidebar_groups[group_key] = {"header": title_label, "children": children}
+        return group
+
+    def _set_sidebar_active_destination(self, destination: str) -> None:
+        for key, button in self.sidebar_links.items():
+            button.setProperty("active", key == destination); button.style().unpolish(button); button.style().polish(button)
+
+    def navigate_to(self, destination: str) -> None:
+        """Navigate to one existing page and select the appropriate existing view."""
+        if destination not in self.sidebar_destinations:
+            return
+        self._set_sidebar_active_destination(destination); self.change_page(self.sidebar_destinations[destination])
+        if destination == "jobs-search":
+            self.job_search.search_locations.setFocus()
+        elif destination == "jobs-match":
+            self.jobs.job_list.setFocus()
+        elif destination == "editor-info":
+            self.editor_info.refresh()
+        elif destination == "editor-resume":
+            self.resume.set_document_mode("Resume")
+        elif destination == "editor-cv":
+            self.resume.set_document_mode("CV")
+        elif destination == "applications-apply":
+            self.application_apply.job_list.setFocus()
+        elif destination == "applications-tracker":
+            self.application_tracker.job_list.setFocus()
+
+    def _set_ai_provider_status(self, text: str, colour: str) -> None:
+        raw = str(text or "").strip()
+        low = raw.casefold()
+        if "ollama" in low and "unavailable" not in low:
+            model = raw.split("Ollama", 1)[1].strip(" —")
+            model = model.replace("(local)", "").strip()
+            label = f"Local AI\n{model}" if model else "Local AI"
+        elif "configured" in low and "api" not in low:
+            label = "External AI\n" + raw.replace(" — configured", "").strip()
+        elif "unavailable" in low or "no local" in low or "not configured" in low:
+            label = "AI Offline"
+        else:
+            label = raw.replace("checking local ", "").replace("AI Provider: ", "") or "AI status"
+        self.ai_provider_label.setText(label); self.ai_provider_dot.setStyleSheet(f"color:{colour}")
+
+    def refresh_ai_provider_status(self) -> None:
+        """Show a truthful provider label without sending any external AI request."""
+        self.ai.reload_settings(); selected = str(self.ai.settings.get("ai_mode") or "Auto")
+        if selected == "API":
+            label = self.ai.api_label()
+            self._set_ai_provider_status(f"{label[5:]} — configured" if label else "API not configured", "#e6a23c" if label else "#9aa1ad")
+            return
+        self._set_ai_provider_status("checking local Ollama…", "#9aa1ad")
+        self.provider_status_worker = TaskThread(self.ai.local_runtime_info)
+        def done(info):
+            models = [str(model) for model in info.get("models", [])]
+            if selected != "Auto":
+                if bool(info.get("available")) and selected in models:
+                    self._set_ai_provider_status(f"Ollama — {selected} (local)", "#59b85a")
+                else:
+                    self._set_ai_provider_status(f"Ollama — {selected} unavailable", "#e6a23c")
+                return
+            preferred = [str(self.ai.settings.get("models", {}).get(key) or "") for key in ("fast", "deep")]
+            model = next((name for name in preferred if name and name in models), models[0] if models else "")
+            if bool(info.get("available")) and model:
+                self._set_ai_provider_status(f"Auto — Ollama {model}", "#59b85a")
+            elif self.ai.api_label():
+                self._set_ai_provider_status(f"Auto — {self.ai.api_label()[5:]} configured", "#e6a23c")
+            else:
+                self._set_ai_provider_status("no local model or API configured", "#9aa1ad")
+        def failed(_error): self._set_ai_provider_status("local AI unavailable", "#9aa1ad")
+        self.provider_status_worker.completed.connect(done); self.provider_status_worker.failed.connect(failed); self.provider_status_worker.start()
+
     def change_page(self, index):
-        self.stack.setCurrentIndex(index); page = self.stack.currentWidget(); effect = QGraphicsOpacityEffect(page); page.setGraphicsEffect(effect); animation = QPropertyAnimation(effect, b"opacity", self); animation.setDuration(170); animation.setStartValue(0.72); animation.setEndValue(1.0); animation.setEasingCurve(QEasingCurve.OutCubic); animation.finished.connect(lambda: page.setGraphicsEffect(None)); self.page_animation = animation; animation.start(); self.refresh_current_page()
+        # Instant page switches are substantially cheaper than animating an entire
+        # card-heavy page through QGraphicsOpacityEffect on every navigation.
+        if self.stack.currentIndex() != index:
+            self.stack.setCurrentIndex(index)
+        self.refresh_current_page()
 
     def refresh_current_page(self):
         page = self.stack.currentWidget()
+        refresh_if_needed = getattr(page, "refresh_if_needed", None)
+        if callable(refresh_if_needed):
+            refresh_if_needed(); return
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
             refresh()
@@ -2197,20 +3547,70 @@ class MainWindow(QMainWindow):
         # all pages on every navigation made the whole application stutter.
         # Pages refresh when they become active; background pages remain idle.
         self.refresh_current_page()
-    def settings_changed(self): self.jobs.refresh_models(); self.jobs.refresh_location_choices(); self.refresh_pages()
+    def _job_search_settings_saved(self):
+        self.jobs.refresh_location_choices()
+
+    def _job_search_completed(self):
+        self.jobs.refresh_location_choices(); self.jobs.mark_dirty(); self.application_apply.mark_dirty(); self.application_tracker.mark_dirty()
+        if self.stack.currentWidget() is self.jobs:
+            self.jobs.refresh_if_needed()
+
+    def _jobs_data_changed(self):
+        # JobsPage already refreshed itself before emitting changed. Only invalidate
+        # dependent pages; do not immediately rebuild the same Match list twice.
+        self.application_apply.mark_dirty(); self.application_tracker.mark_dirty()
+        if self.stack.currentWidget() is self.dashboard:
+            self.dashboard.refresh()
+
+    def _applications_data_changed(self):
+        # The emitting application page has already refreshed itself. Invalidate only
+        # dependent pages so a single status change does not rebuild the same card list twice.
+        source = self.sender()
+        self.jobs.mark_dirty()
+        if source is not self.application_apply:
+            self.application_apply.mark_dirty()
+        if source is not self.application_tracker:
+            self.application_tracker.mark_dirty()
+        if self.stack.currentWidget() is self.dashboard:
+            self.dashboard.refresh()
+
+    def editor_info_changed(self):
+        # Profile/supporting-document edits are consumed on the next AI/generation action.
+        # Avoid rebuilding heavy job/resume previews while the user is typing in Info.
+        if self.stack.currentWidget() is self.resume:
+            self.resume.refresh(load_preview=False)
+
+    def settings_changed(self): self.ai.reload_settings(); self.jobs.refresh_models(); self.jobs.refresh_location_choices(); self.refresh_pages(); self.refresh_ai_provider_status()
 
     def begin_task_state(self, worker: TaskThread, text: str) -> None:
-        self.active_task = worker; self.global_task_text.setText(text); self.global_task_detail.setText("Starting…")
-        self.global_task_progress.setRange(0, 0); self.global_task_progress.show(); self.global_task_cancel.setEnabled(True)
+        # Visible task feedback belongs to the page that started the operation.
+        # Keep only shared cancellation/state bookkeeping here; never show a global
+        # progress widget because an unparented/hidden Qt widget can become a stray
+        # top-level "pythonw" window when show() is called.
+        self.active_task = worker
+        self.global_task_text.setText(text)
+        self.global_task_detail.setText("Starting…")
+        self.global_task_progress.setRange(0, 0)
+        self.global_task_progress.hide()
+        self.global_task_cancel.setEnabled(True)
+        self.global_task_cancel.hide()
 
     def update_task_state(self, text: str, _started_at=None) -> None:
         self.global_task_text.setText(text)
 
     def set_task_progress(self, completed: int, total: int, detail: str) -> None:
-        self.global_task_progress.setRange(0, max(1, total)); self.global_task_progress.setValue(completed); self.global_task_progress.show(); self.global_task_detail.setText(detail)
+        self.global_task_progress.setRange(0, max(1, total))
+        self.global_task_progress.setValue(completed)
+        self.global_task_progress.hide()
+        self.global_task_detail.setText(detail)
 
     def finish_task_state(self, detail: str = "Ready") -> None:
-        self.global_task_text.setText("Ready"); self.global_task_detail.setText(detail); self.global_task_progress.hide(); self.global_task_cancel.setEnabled(False); self.active_task = None
+        self.global_task_text.setText("Ready")
+        self.global_task_detail.setText(detail)
+        self.global_task_progress.hide()
+        self.global_task_cancel.setEnabled(False)
+        self.global_task_cancel.hide()
+        self.active_task = None
 
     def cancel_active_task(self) -> None:
         worker = getattr(self, "active_task", None)

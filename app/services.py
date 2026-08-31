@@ -215,14 +215,16 @@ class JobService:
         if context and description: self.db.update_job(job_id,rule_score=self._rule_score(context,str(record.get("title"))+"\n"+description,str(record.get("location","")))[0])
         return job_id
 
-    def analyze(self, job_id: int, resume: str, selected_model: str | None = None) -> dict:
+    def analyze(self, job_id: int, resume: str, selected_model: str | None = None, *, progress=None, cancelled=None) -> dict:
         job=self.db.job(job_id)
         if not job: raise ValueError("Job not found")
         if not str(resume or "").strip(): raise ValueError("Import an original DOCX resume before analyzing job matches.")
         rule,matched,missing=self._rule_score(resume,job["title"]+"\n"+job["description"],job["location"])
         resume_payload = resume.removeprefix("RESUME:\n")
-        payload=f"RESUME:\n{resume_payload[:12000]}\n\nJOB:\nTitle: {job['title']}\nCompany: {job['company']}\nLocation: {job['location']}\n{job['description'][:12000]}"
-        analysis,model=self.ai.generate_json("job_analysis",JOB_ANALYSIS_PROMPT,payload,selected_model); analysis=validate_job_analysis(analysis); final=weighted_match_score(rule,analysis["ai_score"]); analysis.update({"match_score":final,"rule_score":rule,"recommendation":recommendation(final),"required_matches":list(dict.fromkeys(matched+analysis["required_matches"])),"missing_skills":list(dict.fromkeys(missing+analysis["missing_skills"])),"model_used":model})
+        resume_excerpt, job_excerpt = resume_payload[:12000], str(job["description"] or "")[:12000]
+        payload=f"RESUME:\n{resume_excerpt}\n\nJOB:\nTitle: {job['title']}\nCompany: {job['company']}\nLocation: {job['location']}\n{job_excerpt}"
+        log.debug("job_analysis_payload job_id=%s model=%s resume_chars=%s job_description_chars=%s payload_chars=%s", job_id, selected_model or "routed", len(resume_excerpt), len(job_excerpt), len(payload))
+        analysis,model=self.ai.generate_json("job_analysis",JOB_ANALYSIS_PROMPT,payload,selected_model,progress=progress,cancelled=cancelled); analysis=validate_job_analysis(analysis); final=weighted_match_score(rule,analysis["ai_score"]); analysis.update({"match_score":final,"rule_score":rule,"recommendation":recommendation(final),"required_matches":list(dict.fromkeys(matched+analysis["required_matches"])),"missing_skills":list(dict.fromkeys(missing+analysis["missing_skills"])),"model_used":model})
         self.db.update_job(job_id,rule_score=rule,ai_score=analysis["ai_score"],match_score=final,match_reason=analysis["reason"],strengths_json=json.dumps(analysis["strengths"]),missing_json=json.dumps(analysis["missing_skills"]),risks_json=json.dumps(analysis["risks"]),requirements_json=json.dumps(analysis["required_matches"]),preferred_json=json.dumps(analysis["preferred_matches"]),recommendation=analysis["recommendation"],model_used=model); return analysis
 
     def translate(self, job_id: int, progress=lambda message: None, cancelled=lambda: False) -> dict:
